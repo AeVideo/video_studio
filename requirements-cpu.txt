@@ -1,0 +1,136 @@
+# requirements-cpu.txt
+#
+# Полный набор зависимостей для ЛОКАЛЬНОЙ машины разработчика (CPU).
+# Собран слиянием исходных requirements.txt video-pipeline и
+# requirements_full.txt openai-whisper (см. COLAB_MIGRATION_PLAN.md, раздел 3)
+# + добавлены пакеты, которые реально импортируются в коде, но отсутствовали
+# в обоих исходных файлах: fastapi, uvicorn (services/subtitle_api.py),
+# elevenlabs (core/narration/elevenlabs_tts.py), gradio (web/gradio_app.py).
+#
+# torch/torchaudio/torchvision — CPU-сборки (+cpu). Для Colab/GPU
+# используйте requirements-gpu.txt — там эти три пакета исключены и
+# ставятся отдельной командой с CUDA-индексом (см. notebooks/colab_setup.ipynb).
+#
+# ВАЖНО: torch/torchaudio/torchvision с суффиксом +cpu физически не
+# резолвятся с обычного PyPI (index.pypi.org не публикует локальные версии
+# вида "+cpu") — обязательно нужен --extra-index-url на официальный индекс
+# PyTorch, иначе pip install упадёт на первом же пакете с "No matching
+# distribution found for torch==...+cpu". Это подтверждено практической
+# попыткой установки при подготовке этого файла, не гипотеза.
+#
+# Установка:
+#   python3 -m venv .venv
+#   source .venv/bin/activate      (Windows: .venv\Scripts\activate)
+#   pip install -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
+#   pip install -e . --no-deps
+#   playwright install firefox     # для scraping/ (CamoufoxSession)
+#   camoufox fetch                 # докачивает патченный браузер Camoufox
+
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+annotated-types==0.8.0
+anyio==4.14.2
+apify_fingerprint_datapoints==0.15.0
+attrs==26.1.0
+beautifulsoup4==4.15.0
+blessed==1.48.0
+browserforge==1.2.4
+camoufox==0.5.5
+certifi==2026.7.22
+cffi==2.1.1
+chardet==5.2.0
+charset-normalizer==3.4.9
+click==8.4.2
+cryptography==50.0.0
+distro==1.9.0
+editor==1.8.0
+elevenlabs==2.18.0
+fastapi==0.121.0
+filelock==3.29.0
+frozenlist==1.8.0
+fsspec==2026.4.0
+ftfy==6.3.1
+geoip2==5.3.0
+greenlet==3.5.5
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpcore2==2.10.0
+httpx==0.28.1
+httpx2==2.10.0
+huggingface_hub==1.27.0
+idna==3.18
+inquirer==3.4.1
+Jinja2==3.1.6
+jinxed==2.1.0
+jiter==0.16.0
+language-tags==1.3.1
+llvmlite==0.48.0
+lxml==6.1.2
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+maxminddb==3.1.1
+mdurl==0.1.2
+more-itertools==11.1.0
+mpmath==1.3.0
+multidict==6.7.1
+networkx==3.6.1
+numba==0.66.0
+numpy==2.4.4  # прижато к 2.4.4 из-за numba==0.66.0 (требует numpy<2.5) — см. openai-whisper
+open_clip_torch==3.3.0
+openai==3.0.0
+openai-whisper==20250625
+orjson==3.12.0
+packaging==26.3
+pdf2image==1.17.0
+pdfminer.six==20251230  # версия, которую жёстко требует pdfplumber==0.11.9
+pdfplumber==0.11.9  # 0.11.10 требует Pillow>=12.2.0 (конфликт с gradio<12.0); 0.11.9 -> Pillow>=9.1
+pillow==11.3.0  # прижато ниже 12.0 — конфликт с gradio (pillow<12.0) и совместимо с pdfplumber>=9.1
+platformdirs==4.11.3
+playwright==1.60.0
+propcache==0.5.2
+pycparser==3.0
+pydantic==2.11.10  # прижато <2.12 — конфликт с gradio (pydantic<2.12)
+pydantic_core==2.33.2  # версия, которую жёстко требует pydantic==2.11.10
+pyee==13.0.1
+Pygments==2.21.0
+pypdfium2==5.13.0
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.19
+PyQt5_sip==12.19.0
+PySocks==1.7.1
+pytesseract==0.3.13
+python-dotenv==1.2.2
+PyYAML==6.0.3
+readchar==4.2.2
+regex==2026.7.19
+requests==2.34.2
+rich==15.0.0
+rich-click==1.9.8
+runs==1.3.0
+safetensors==0.8.0
+screeninfo==0.8.1
+setuptools==78.1.0
+sniffio==1.3.1
+soupsieve==2.9.2
+subtitle-parser==2.0.1
+sympy==1.14.0
+tiktoken==0.13.0
+timm==1.0.28
+torch==2.13.0+cpu
+torchaudio==2.11.0+cpu
+torchvision==0.28.0+cpu
+tqdm==4.70.0
+triton==3.7.1
+truststore==0.10.4
+typing-inspection==0.4.3
+typing_extensions==4.16.0
+ua-parser==1.0.2
+ua-parser-builtins==202606
+urllib3==2.7.0
+uvicorn==0.38.0
+wcwidth==0.8.2
+xmod==1.10.0
+yarl==1.24.5
+gradio==5.49.1

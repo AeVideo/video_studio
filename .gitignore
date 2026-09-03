@@ -1,0 +1,31 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+*.egg-info/
+dist/
+build/
+.aider*
+.env
+*.log
+
+# Данные/выход — не код, не коммитим (см. config/paths.py, VIDEO_STUDIO_HOME)
+storage/projects/*
+storage/output/*
+storage/logs/*
+storage/models_cache/*
+!storage/projects/.gitkeep
+!storage/output/.gitkeep
+!storage/logs/.gitkeep
+!storage/models_cache/.gitkeep
+
+# Camoufox/Playwright browser-профили и бинарники — не коммитим (секреты сессий)
+browser_profiles/
+*.pid
+
+# Локальный VIDEO_STUDIO_HOME по умолчанию, если создаётся рядом с репо
+video_studio_home/

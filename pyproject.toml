@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video_studio"
+version = "0.1.0"
+description = "Объединённый пайплайн video-pipeline + openai-whisper (ASR/субтитры) под одной крышей"
+requires-python = ">=3.10"
+readme = "README.md"
+dynamic = ["dependencies"]
+
+[tool.setuptools]
+# Явно перечисляем top-level пакеты — они и есть новая структура каталогов
+# (см. COLAB_MIGRATION_PLAN.md, раздел 3.1). "storage" и "notebooks" НЕ
+# перечислены — это не код, а данные/ноутбуки, пакетами быть не должны.
+packages = [
+    "core", "core.script", "core.scenes", "core.video_sources",
+    "core.narration", "core.assembly", "core.accounts", "core.providers",
+    "asr",
+    "scraping",
+    "services",
+    "web",
+    "config",
+    "desktop", "desktop.video_pipeline_gui", "desktop.whisper_gui", "desktop.whisper_gui.tabs",
+]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements-cpu.txt"] }
+
+[tool.setuptools.package-data]
+asr = ["fonts/*.ttf", "fonts/OFL.txt", "styles/*.json"]
