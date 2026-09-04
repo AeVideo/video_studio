@@ -9,7 +9,7 @@ Web-интерфейс поверх той же бизнес-логики, чт�
 
 См. COLAB_MIGRATION_PLAN.md, раздел 5 — почему Gradio первый, и раздел 5.2 —
 пример адаптера, на основе которого написана вкладка "Сценарий" ниже (сверено
-с desktop/video_pipeline_gui/workers.py::ScriptWorker).
+с desktop/video_pipeline_gui/workers.py::ScriptWorker и ::CaseScrapeWorker).
 
 Запуск:
     python -m web.gradio_app
@@ -18,7 +18,8 @@ Web-интерфейс поверх той же бизнес-логики, чт�
 см. IN_COLAB) для публичной ссылки без отдельного деплоя.
 
 Готовые вкладки (Phase 2, TASK W-01/W-02):
-    - Источник → Сценарий   (core/script/book_to_script.py)
+    - Источник → Сценарий   (core/script/book_to_script.py; источник — файл
+      .txt ИЛИ дело FBI Vault через scraping/, см. IN_COLAB ниже)
     - Субтитры               (asr/transcribe.py, GPU по умолчанию на Colab)
 
 Остальные стадии (Phase 2, TASK W-03/W-04 — подбор видео, сборка) НЕ
@@ -28,34 +29,87 @@ TODO, по тому же паттерну адаптера. Портироват
 """
 import json
 import os
+import tempfile
 
 import gradio as gr
 
 from config.paths import PROJECTS_ROOT
 from core.script import book_to_script
-from asr.transcribe import run_transcribe, run_proofread, default_device
+from asr.transcribe import run_transcribe, run_proofread, default_device, default_model
+
+IN_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
+
+
+# ---------------------------------------------------------------------------
+# Вкладка 1a: FBI Vault -> текст дела
+# Соответствует desktop/video_pipeline_gui/workers.py::CaseScrapeWorker.run(),
+# логика 1:1 та же (scraping/fbi_vault_index.py + fbi_vault_scraper.py),
+# только вызов на клик кнопки вместо QThread. Работает ТОЛЬКО локально —
+# использует Camoufox (реальный браузер), на Colab не запускать
+# (см. COLAB_MIGRATION_PLAN.md, раздел 2.4 — та же граница, что для Flow/Qwen).
+# ---------------------------------------------------------------------------
+
+def fbi_search(query):
+    from scraping.fbi_vault_index import load_or_build_index, search_index
+
+    idx = load_or_build_index()
+    results = search_index(idx, query or "", limit=30)
+    if not results:
+        return gr.update(choices=[], value=None), {}
+
+    choices = [r["title"] for r in results]
+    mapping = {r["title"]: r["url"] for r in results}
+    return gr.update(choices=choices, value=choices[0]), mapping
+
+
+def fbi_build_corpus(selected_title, case_map, max_parts, progress=gr.Progress()):
+    if not selected_title or not case_map or selected_title not in case_map:
+        raise gr.Error("Сначала найдите дело и выберите его из списка")
+
+    from scraping.fbi_vault_scraper import build_case_corpus
+
+    case_url = case_map[selected_title]
+    out_dir = tempfile.mkdtemp(prefix="fbi_case_")
+    max_parts_val = int(max_parts) if max_parts else None
+
+    def on_progress(percent, message):
+        progress(min(percent / 100, 0.98), desc=message)
+
+    progress(0.0, desc="Открываю Camoufox-сессию...")
+    txt_path = build_case_corpus(case_url, out_dir, max_parts=max_parts_val, on_progress=on_progress)
+
+    with open(txt_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    progress(1.0, desc="Готово")
+    return text, f"Собрано {len(text)} символов из «{selected_title}» -> {txt_path}"
 
 
 # ---------------------------------------------------------------------------
 # Вкладка 1: Источник -> Сценарий
-# Соответствует desktop/video_pipeline_gui/workers.py::ScriptWorker.run()
-# Логика 1:1 та же, просто pyqtSignal -> gr.Progress()/return.
+# Источник текста — либо загруженный .txt, либо book_text_preview, уже
+# заполненный вкладкой FBI Vault выше (что заполнено, то и используется;
+# если оба — приоритет у book_text_preview, он редактируемый).
 # ---------------------------------------------------------------------------
 
-def run_script_stage(book_file, duration_minutes, language, project_id, content_mode,
-                      progress=gr.Progress()):
-    if book_file is None:
-        raise gr.Error("Загрузите текстовый источник (.txt)")
+def run_script_stage(book_file, book_text_preview, duration_minutes, language,
+                      project_id, content_mode, progress=gr.Progress()):
     if not project_id:
         raise gr.Error("Укажите имя проекта — по нему создастся папка в PROJECTS_ROOT")
+
+    if book_text_preview and book_text_preview.strip():
+        book_text = book_text_preview
+    elif book_file is not None:
+        with open(book_file.name, "r", encoding="utf-8") as f:
+            book_text = f.read()
+    else:
+        raise gr.Error("Загрузите файл .txt или соберите текст дела на вкладке FBI Vault")
 
     out_dir = os.path.join(PROJECTS_ROOT, project_id)
     os.makedirs(out_dir, exist_ok=True)
 
     progress(0.05, desc="Разбиваю источник на истории...")
     client = book_to_script.get_client()
-    with open(book_file.name, "r", encoding="utf-8") as f:
-        book_text = f.read()
 
     stories = book_to_script.split_book_into_stories(book_text, client)
     if not stories:
@@ -99,7 +153,9 @@ def run_subtitles_stage(audio_file, reference_text_file, language, model,
         raise gr.Error("Загрузите аудио/видео с озвучкой")
 
     device = default_device()
-    progress(0.0, desc=f"Устройство: {device}")
+    if not model or model.startswith("Авто"):
+        model = default_model(device)
+    progress(0.0, desc=f"Устройство: {device}, модель: {model}")
 
     def on_progress(percent, message):
         progress(min(percent / 100, 0.94), desc=message)
@@ -112,9 +168,9 @@ def run_subtitles_stage(audio_file, reference_text_file, language, model,
     if reference_text_file is not None:
         progress(0.95, desc="Сверяю с эталонным текстом...")
         fixed_srt_path = run_proofread(raw_srt_path, reference_text_file.name)
-        return fixed_srt_path, f"Готово (устройство: {device}). Вычитано по эталону."
+        return fixed_srt_path, f"Готово (устройство: {device}, модель: {model}). Вычитано по эталону."
 
-    return raw_srt_path, f"Готово (устройство: {device}). Без вычитки — эталонный текст не загружен."
+    return raw_srt_path, f"Готово (устройство: {device}, модель: {model}). Без вычитки — эталонный текст не загружен."
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +186,48 @@ def build_app() -> gr.Blocks:
         )
 
         with gr.Tab("1. Источник → Сценарий"):
-            book_file = gr.File(label="Текстовый источник (.txt)")
+            source_kind = gr.Radio(
+                ["Файл (.txt)", "Дело FBI Vault — только локально, не на Colab"],
+                value="Файл (.txt)", label="Источник текста",
+            )
+
+            with gr.Group(visible=True) as file_group:
+                book_file = gr.File(label="Текстовый источник (.txt)")
+
+            with gr.Group(visible=False) as fbi_group:
+                if IN_COLAB:
+                    gr.Markdown(
+                        "⚠ Похоже, это Colab. FBI Vault использует настоящий браузер "
+                        "(Camoufox) — на headless-рантайме Colab это не работает и не "
+                        "нужно (см. COLAB_MIGRATION_PLAN.md, раздел 2.4). Соберите текст "
+                        "дела на локальной машине и загрузите готовый .txt выше."
+                    )
+                fbi_query = gr.Textbox(label="Поиск по названию дела (например: Cooper)")
+                fbi_search_btn = gr.Button("Искать в индексе FBI Vault")
+                fbi_case_map = gr.State({})
+                fbi_results = gr.Dropdown(label="Найденные дела", choices=[], interactive=True)
+                fbi_max_parts = gr.Number(label="Макс. частей дела (0 = все)", value=5)
+                fbi_build_btn = gr.Button("Скачать и собрать текст дела")
+                fbi_status = gr.Textbox(label="Статус сбора", interactive=False)
+
+            book_text_preview = gr.Textbox(
+                label="Текст источника (редактируемый — сюда попадёт собранное дело FBI Vault)",
+                lines=8, visible=False,
+            )
+
+            def _toggle_source(kind):
+                is_fbi = kind.startswith("Дело FBI")
+                return gr.update(visible=not is_fbi), gr.update(visible=is_fbi), gr.update(visible=is_fbi)
+
+            source_kind.change(_toggle_source, inputs=source_kind,
+                                outputs=[file_group, fbi_group, book_text_preview])
+
+            fbi_search_btn.click(fbi_search, inputs=fbi_query, outputs=[fbi_results, fbi_case_map])
+            fbi_build_btn.click(
+                fbi_build_corpus, inputs=[fbi_results, fbi_case_map, fbi_max_parts],
+                outputs=[book_text_preview, fbi_status],
+            )
+
             with gr.Row():
                 duration_minutes = gr.Number(label="Длительность (мин)", value=5)
                 language = gr.Dropdown(["ru", "en"], value="ru", label="Язык")
@@ -143,19 +240,21 @@ def build_app() -> gr.Blocks:
             script_out = gr.Textbox(label="Результат", lines=10)
             script_btn.click(
                 run_script_stage,
-                inputs=[book_file, duration_minutes, language, project_id, content_mode],
+                inputs=[book_file, book_text_preview, duration_minutes, language, project_id, content_mode],
                 outputs=script_out,
             )
 
         with gr.Tab("2. Субтитры (GPU)"):
-            gr.Markdown(f"Устройство по умолчанию сейчас: **{default_device()}** "
-                        "(автоопределение — cuda, если доступна, иначе cpu)")
+            gr.Markdown(f"Устройство по умолчанию сейчас: **{default_device()}**, "
+                        f"модель по умолчанию: **{default_model()}** "
+                        "(base на CPU — тайминги, точный текст всё равно из вычитки; large-v3 на GPU)")
             audio_file = gr.File(label="Аудио/видео с озвучкой")
             reference_text_file = gr.File(label="Эталонный текст (narration_text.txt) — опционально, для вычитки")
             with gr.Row():
                 sub_language = gr.Dropdown(["ru", "en", "Auto"], value="ru", label="Язык")
                 sub_model = gr.Dropdown(
-                    ["large-v3", "medium", "small"], value="large-v3", label="Модель whisper",
+                    ["Авто (по устройству)", "large-v3", "medium", "small", "base"],
+                    value="Авто (по устройству)", label="Модель whisper",
                 )
             subs_btn = gr.Button("Распознать", variant="primary")
             subs_file_out = gr.File(label="Готовый .srt")
@@ -184,8 +283,6 @@ def build_app() -> gr.Blocks:
 
     return demo
 
-
-IN_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
 
 if __name__ == "__main__":
     app = build_app()

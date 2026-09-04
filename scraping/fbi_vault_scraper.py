@@ -32,7 +32,7 @@ requests напрямую.
 import argparse
 import os
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
 
 from bs4 import BeautifulSoup
 from scraping.cloudflare_session import CamoufoxSession
@@ -193,14 +193,23 @@ def list_case_parts_only(case_url: str) -> List[Dict]:
 def build_case_corpus(case_url: str, out_dir: str, max_parts: Optional[int] = None,
                        selected_indices: Optional[List[int]] = None,
                        max_ocr_pages: Optional[int] = None,
-                       delay: float = 1.0) -> str:
+                       delay: float = 1.0,
+                       on_progress: Optional[Callable[[int, str], None]] = None) -> str:
+    """on_progress(percent, message) — опциональный колбэк (см. тот же паттерн
+    в asr/transcribe.py::run_transcribe). Если не передан, поведение как
+    раньше — просто print() по ходу дела (для CLI-использования)."""
+    def _report(percent, message):
+        print(message)
+        if on_progress:
+            on_progress(percent, message)
+
     os.makedirs(out_dir, exist_ok=True)
     out_txt = os.path.join(out_dir, "combined_source.txt")
     # чистим файл перед новым прогоном, дальше пишем инкрементально после каждой части
     open(out_txt, "w", encoding="utf-8").close()
 
     with CamoufoxSession() as cf:
-        print(f"Собираю список частей дела: {case_url}")
+        _report(0, f"Собираю список частей дела: {case_url}")
         all_parts = list_case_parts(case_url, cf)
 
         if selected_indices:
@@ -209,31 +218,32 @@ def build_case_corpus(case_url: str, out_dir: str, max_parts: Optional[int] = No
             parts = list(enumerate(all_parts[:max_parts], 1))
         else:
             parts = list(enumerate(all_parts, 1))
-        print(f"Всего частей в деле: {len(all_parts)}, к обработке выбрано: {len(parts)}")
+        _report(2, f"Всего частей в деле: {len(all_parts)}, к обработке выбрано: {len(parts)}")
 
         parts_done = 0
-        for i, part in parts:
-            print(f"[{i}/{len(all_parts)}] {part['title']}")
+        for n, (i, part) in enumerate(parts, 1):
+            percent = 2 + int(96 * n / max(len(parts), 1))
+            _report(percent, f"[{i}/{len(all_parts)}] {part['title']}")
             pdf_path = os.path.join(out_dir, f"part_{i:03d}.pdf")
             ok = fetch_part_pdf(part["url"], pdf_path, cf)
             if not ok:
-                print("    Не удалось скачать валидный PDF после нескольких попыток, пропускаю")
+                _report(percent, "    Не удалось скачать валидный PDF после нескольких попыток, пропускаю")
                 continue
 
             try:
                 text, method = extract_text(pdf_path, max_ocr_pages=max_ocr_pages)
             except Exception as e:
-                print(f"    Ошибка извлечения текста: {e}")
+                _report(percent, f"    Ошибка извлечения текста: {e}")
                 continue
 
-            print(f"    извлечено {len(text)} символов ({method})")
+            _report(percent, f"    извлечено {len(text)} символов ({method})")
             with open(out_txt, "a", encoding="utf-8") as f:
                 f.write(f"--- {part['title']} ---\n{text}\n\n")
             parts_done += 1
 
             time.sleep(delay)  # вежливость к серверу, не обход защиты — её тут нет
 
-    print(f"Готово: {out_txt} ({parts_done}/{len(parts)} частей записано)")
+    _report(100, f"Готово: {out_txt} ({parts_done}/{len(parts)} частей записано)")
     return out_txt
 
 

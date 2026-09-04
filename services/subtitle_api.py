@@ -61,7 +61,7 @@ def _update_job(job_id: str, **kwargs):
 class TranscribeRequest(BaseModel):
     audio_path: str
     language: Optional[str] = "ru"
-    model: str = "large-v3"
+    model: Optional[str] = None  # None -> asr.transcribe.default_model(device)
     # device=None -> автоопределение в asr.transcribe.default_device()
     # (cuda, если физически доступна — Colab/T4 — иначе cpu). Раньше здесь
     # был хардкод "cpu", и GPU не использовалась даже если была доступна
@@ -115,7 +115,7 @@ class TranscribeAndProofreadRequest(BaseModel):
     audio_path: str
     reference_text_path: str
     language: Optional[str] = "ru"
-    model: str = "large-v3"
+    model: Optional[str] = None  # None -> asr.transcribe.default_model(device)
     device: Optional[str] = None
     word_timestamps: bool = True
     whisper_exe: Optional[str] = None

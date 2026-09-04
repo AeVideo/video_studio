@@ -44,6 +44,20 @@ def default_device() -> str:
         return "cpu"
 
 
+def default_model(device: Optional[str] = None) -> str:
+    """Модель whisper по умолчанию — зависит от устройства, а не константа.
+
+    Whisper здесь отвечает в первую очередь за ТАЙМИНГИ (посегментные
+    временные метки), а не за финальный текст — реальные слова всё равно
+    берутся из эталонного narration_text.txt через align_and_fix (см.
+    asr/fix_srt.py). Значит на CPU нет смысла ждать large-v3/small ради
+    точности распознавания, которая всё равно будет переписана вычиткой:
+    base достаточно и в разы быстрее. На GPU (Colab/T4) время перестаёт
+    быть узким местом, поэтому там по умолчанию точность повыше — large-v3."""
+    device = device or default_device()
+    return "large-v3" if device == "cuda" else "base"
+
+
 def build_whisper_command(whisper_exe, input_path, model, language, device,
                            word_timestamps, output_dir):
     cmd = [
@@ -66,7 +80,7 @@ _PROGRESS_RE = re.compile(r"(\d+)%\|")
 def run_transcribe(
     audio_path: str,
     language: Optional[str] = "ru",
-    model: str = "large-v3",
+    model: Optional[str] = None,
     device: Optional[str] = None,
     word_timestamps: bool = True,
     whisper_exe: Optional[str] = None,
@@ -74,9 +88,11 @@ def run_transcribe(
 ) -> str:
     """Запускает whisper CLI и возвращает путь к .srt.
 
-    device=None -> автоопределение (default_device()) — вот здесь и решается
-    TASK G-02: раньше это было зашито как "cpu" в Pydantic-модели, теперь
-    GPU используется по умолчанию, если она физически доступна.
+    device=None -> автоопределение (default_device()).
+    model=None  -> автоопределение по устройству (default_model(), см. выше) —
+    раньше здесь всегда стоял хардкод "large-v3" независимо от устройства,
+    что на CPU было избыточно медленно ради точности, которую всё равно
+    переписывает align_and_fix.
 
     on_progress(percent, message) — необязательный колбэк; если передан,
     транскрипция запускается в потоковом режиме (читаем tqdm-вывод whisper
@@ -86,6 +102,7 @@ def run_transcribe(
         raise FileNotFoundError(f"audio_path не найден: {audio_path}")
 
     device = device or default_device()
+    model = model or default_model(device)
     whisper_exe = whisper_exe or default_whisper_exe()
 
     job_dir = os.path.join(API_JOBS_DIR, f"transcribe_{uuid.uuid4().hex}")
