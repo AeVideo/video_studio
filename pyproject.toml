@@ -23,6 +23,7 @@ packages = [
     "web",
     "config",
     "desktop", "desktop.video_pipeline_gui", "desktop.whisper_gui", "desktop.whisper_gui.tabs",
+    "tools", "tools.audio_capture",
 ]
 
 [tool.setuptools.dynamic]

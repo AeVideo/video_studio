@@ -33,15 +33,33 @@ class CamoufoxSession:
     в рамках той же сессии — Cloudflare уже доверяет, переходы быстрее.
 
     Поддержка профилей:
-      profile_path — путь к постоянному профилю (persistent user-data directory).
-      Если передан, Camoufox запускается с этим профилем, что позволяет
-      переиспользовать cookies, localStorage и другие данные между сессиями
-      (например, для разных Flow/Google-аккаунтов в будущем).
+      profile_path — путь к постоянному профилю (persistent user-data
+      directory). Если передан, Camoufox запускается через
+      launch_persistent_context (persistent_context=True) с этим каталогом
+      как user_data_dir — это позволяет переиспользовать cookies,
+      localStorage и сессию входа между запусками (например, для разных
+      Flow/Google/HeyGen-аккаунтов). Без profile_path — обычный launch(),
+      как раньше, ничего не меняется.
     """
 
     def __init__(self, headless: str = "virtual", humanize: bool = True,
                  profile_path: Optional[str] = None):
-        self._cm = Camoufox(headless=headless, humanize=humanize, profile=profile_path)
+        kwargs = {"headless": headless, "humanize": humanize}
+        if profile_path:
+            # user_data_dir сам по себе ничего не даёт — Camoufox решает,
+            # вызывать playwright.firefox.launch() или
+            # launch_persistent_context(), ТОЛЬКО по отдельному флагу
+            # persistent_context (проверено по исходникам camoufox/utils.py
+            # и playwright.sync_api). Без persistent_context=True упадёт
+            # TypeError на launch(), точно так же как раньше падал profile=
+            # — просто на другом имени параметра. При persistent_context=True
+            # Camoufox возвращает BrowserContext вместо Browser — у него тоже
+            # есть .new_page(), поэтому self.browser.new_page() ниже работает
+            # без изменений в обоих режимах (с профилем и без).
+            kwargs["user_data_dir"] = profile_path
+            kwargs["persistent_context"] = True
+
+        self._cm = Camoufox(**kwargs)
         self.browser = None
         self.page = None
 

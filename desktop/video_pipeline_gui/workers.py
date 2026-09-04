@@ -386,7 +386,7 @@ class ElevenLabsWorker(QThread):
 
     def run(self):
         try:
-            import elevenlabs_tts
+            from core.narration import elevenlabs_tts
             with open(self.text_path, "r", encoding="utf-8") as f:
                 text = f.read()
 

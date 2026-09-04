@@ -42,9 +42,9 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 try:
-    import archive_org_search
+    from core.video_sources import archive_org_search
 except ImportError:
-    archive_org_search = None  # третий источник опционален — если файла нет рядом, просто не используем
+    archive_org_search = None  # третий источник опционален — если модуля нет, просто не используем
 
 load_dotenv()  # подхватывает .env из текущей папки — export больше не нужен
 

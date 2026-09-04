@@ -7,7 +7,7 @@ A-Z. Значит, можно скачать один раз, сохранить
 по кэшу мгновенно, без обращения к сети при каждом клике в GUI.
 
 Использование:
-    from fbi_vault_index import load_or_build_index, search_index
+    from scraping.fbi_vault_index import load_or_build_index, search_index
 
     index = load_or_build_index()       # первый раз скачает, потом из кэша
     results = search_index(index, "купер")   # подстрочный поиск без учёта регистра
