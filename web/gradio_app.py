@@ -85,6 +85,32 @@ def fbi_build_corpus(selected_title, case_map, max_parts, progress=gr.Progress()
     return text, f"Собрано {len(text)} символов из «{selected_title}» -> {txt_path}"
 
 
+def fbi_extract_from_pdfs(pdf_files, progress=gr.Progress()):
+    """Если PDF уже скачаны (локально раньше, или перенесены на Colab через
+    Drive) — извлекает текст БЕЗ Camoufox. Работает и на Colab: browser здесь
+    не участвует, только pdfplumber/OCR (см. scraping/fbi_vault_scraper.py,
+    extract_corpus_from_pdfs — разделено от скачивания намеренно)."""
+    if not pdf_files:
+        raise gr.Error("Загрузите один или несколько PDF-файлов")
+
+    from scraping.fbi_vault_scraper import extract_corpus_from_pdfs
+
+    pdf_paths = [f.name for f in pdf_files]
+    out_txt = os.path.join(tempfile.mkdtemp(prefix="fbi_pdfs_"), "combined_source.txt")
+
+    def on_progress(percent, message):
+        progress(min(percent / 100, 0.98), desc=message)
+
+    progress(0.0, desc=f"Обрабатываю {len(pdf_paths)} PDF...")
+    extract_corpus_from_pdfs(pdf_paths, out_txt, on_progress=on_progress)
+
+    with open(out_txt, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    progress(1.0, desc="Готово")
+    return text, f"Извлечено {len(text)} символов из {len(pdf_paths)} PDF -> {out_txt}"
+
+
 # ---------------------------------------------------------------------------
 # Вкладка 1: Источник -> Сценарий
 # Источник текста — либо загруженный .txt, либо book_text_preview, уже
@@ -195,19 +221,33 @@ def build_app() -> gr.Blocks:
                 book_file = gr.File(label="Текстовый источник (.txt)")
 
             with gr.Group(visible=False) as fbi_group:
-                if IN_COLAB:
-                    gr.Markdown(
-                        "⚠ Похоже, это Colab. FBI Vault использует настоящий браузер "
-                        "(Camoufox) — на headless-рантайме Colab это не работает и не "
-                        "нужно (см. COLAB_MIGRATION_PLAN.md, раздел 2.4). Соберите текст "
-                        "дела на локальной машине и загрузите готовый .txt выше."
-                    )
-                fbi_query = gr.Textbox(label="Поиск по названию дела (например: Cooper)")
-                fbi_search_btn = gr.Button("Искать в индексе FBI Vault")
-                fbi_case_map = gr.State({})
-                fbi_results = gr.Dropdown(label="Найденные дела", choices=[], interactive=True)
-                fbi_max_parts = gr.Number(label="Макс. частей дела (0 = все)", value=5)
-                fbi_build_btn = gr.Button("Скачать и собрать текст дела")
+                gr.Markdown(
+                    "**Поиск и скачивание** (нужен Camoufox — реальный браузер) работает "
+                    "только на локальной машине. **Если PDF уже скачаны раньше** — их можно "
+                    "загрузить и извлечь текст ниже где угодно, включая Colab: этот шаг "
+                    "браузер уже не трогает, только pdfplumber/OCR."
+                )
+
+                with gr.Accordion("Поиск и скачивание дела (только локально)", open=not IN_COLAB):
+                    if IN_COLAB:
+                        gr.Markdown(
+                            "⚠ Это Colab — Camoufox здесь не запустится (нет полноценного "
+                            "рендеринга + Cloudflare жёстче относится к облачным IP, "
+                            "см. COLAB_MIGRATION_PLAN.md, раздел 2.4). Соберите дело на "
+                            "локальной машине, перенесите PDF через Drive и используйте "
+                            "блок ниже."
+                        )
+                    fbi_query = gr.Textbox(label="Поиск по названию дела (например: Cooper)")
+                    fbi_search_btn = gr.Button("Искать в индексе FBI Vault")
+                    fbi_case_map = gr.State({})
+                    fbi_results = gr.Dropdown(label="Найденные дела", choices=[], interactive=True)
+                    fbi_max_parts = gr.Number(label="Макс. частей дела (0 = все)", value=5)
+                    fbi_build_btn = gr.Button("Скачать и собрать текст дела")
+
+                with gr.Accordion("PDF уже скачаны — извлечь текст (работает и на Colab)", open=IN_COLAB):
+                    fbi_pdf_files = gr.Files(label="PDF-файлы дела", file_types=[".pdf"])
+                    fbi_extract_btn = gr.Button("Извлечь текст из PDF", variant="primary")
+
                 fbi_status = gr.Textbox(label="Статус сбора", interactive=False)
 
             book_text_preview = gr.Textbox(
@@ -225,6 +265,10 @@ def build_app() -> gr.Blocks:
             fbi_search_btn.click(fbi_search, inputs=fbi_query, outputs=[fbi_results, fbi_case_map])
             fbi_build_btn.click(
                 fbi_build_corpus, inputs=[fbi_results, fbi_case_map, fbi_max_parts],
+                outputs=[book_text_preview, fbi_status],
+            )
+            fbi_extract_btn.click(
+                fbi_extract_from_pdfs, inputs=fbi_pdf_files,
                 outputs=[book_text_preview, fbi_status],
             )
 

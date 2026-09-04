@@ -190,23 +190,24 @@ def list_case_parts_only(case_url: str) -> List[Dict]:
 
 # ---------- 4. Оркестрация: дело -> единый текстовый файл ----------
 
-def build_case_corpus(case_url: str, out_dir: str, max_parts: Optional[int] = None,
-                       selected_indices: Optional[List[int]] = None,
-                       max_ocr_pages: Optional[int] = None,
-                       delay: float = 1.0,
-                       on_progress: Optional[Callable[[int, str], None]] = None) -> str:
-    """on_progress(percent, message) — опциональный колбэк (см. тот же паттерн
-    в asr/transcribe.py::run_transcribe). Если не передан, поведение как
-    раньше — просто print() по ходу дела (для CLI-использования)."""
+def download_case_pdfs(case_url: str, out_dir: str, max_parts: Optional[int] = None,
+                        selected_indices: Optional[List[int]] = None,
+                        delay: float = 1.0,
+                        on_progress: Optional[Callable[[int, str], None]] = None) -> List[str]:
+    """ТОЛЬКО скачивание PDF-частей дела — единственная часть всего процесса,
+    которой реально нужен Camoufox (обход Cloudflare). Работает ТОЛЬКО
+    локально (см. COLAB_MIGRATION_PLAN.md, раздел 2.4).
+
+    Возвращает список путей к скачанным .pdf. Извлечение текста из них —
+    отдельный шаг, extract_corpus_from_pdfs() ниже, который браузер уже не
+    трогает и одинаково работает что локально, что на Colab."""
     def _report(percent, message):
         print(message)
         if on_progress:
             on_progress(percent, message)
 
     os.makedirs(out_dir, exist_ok=True)
-    out_txt = os.path.join(out_dir, "combined_source.txt")
-    # чистим файл перед новым прогоном, дальше пишем инкрементально после каждой части
-    open(out_txt, "w", encoding="utf-8").close()
+    pdf_paths = []
 
     with CamoufoxSession() as cf:
         _report(0, f"Собираю список частей дела: {case_url}")
@@ -218,33 +219,75 @@ def build_case_corpus(case_url: str, out_dir: str, max_parts: Optional[int] = No
             parts = list(enumerate(all_parts[:max_parts], 1))
         else:
             parts = list(enumerate(all_parts, 1))
-        _report(2, f"Всего частей в деле: {len(all_parts)}, к обработке выбрано: {len(parts)}")
+        _report(2, f"Всего частей в деле: {len(all_parts)}, к скачиванию выбрано: {len(parts)}")
 
-        parts_done = 0
         for n, (i, part) in enumerate(parts, 1):
             percent = 2 + int(96 * n / max(len(parts), 1))
             _report(percent, f"[{i}/{len(all_parts)}] {part['title']}")
             pdf_path = os.path.join(out_dir, f"part_{i:03d}.pdf")
             ok = fetch_part_pdf(part["url"], pdf_path, cf)
-            if not ok:
+            if ok:
+                pdf_paths.append(pdf_path)
+            else:
                 _report(percent, "    Не удалось скачать валидный PDF после нескольких попыток, пропускаю")
-                continue
-
-            try:
-                text, method = extract_text(pdf_path, max_ocr_pages=max_ocr_pages)
-            except Exception as e:
-                _report(percent, f"    Ошибка извлечения текста: {e}")
-                continue
-
-            _report(percent, f"    извлечено {len(text)} символов ({method})")
-            with open(out_txt, "a", encoding="utf-8") as f:
-                f.write(f"--- {part['title']} ---\n{text}\n\n")
-            parts_done += 1
-
             time.sleep(delay)  # вежливость к серверу, не обход защиты — её тут нет
 
-    _report(100, f"Готово: {out_txt} ({parts_done}/{len(parts)} частей записано)")
+    _report(100, f"Готово: скачано {len(pdf_paths)}/{len(parts)} PDF в {out_dir}")
+    return pdf_paths
+
+
+def extract_corpus_from_pdfs(pdf_paths: List[str], out_txt: str,
+                              max_ocr_pages: Optional[int] = None,
+                              on_progress: Optional[Callable[[int, str], None]] = None) -> str:
+    """Извлечение текста из УЖЕ СКАЧАННЫХ PDF (pdfplumber/OCR) — обычный
+    Python, никакого браузера. Работает где угодно, включая Colab: если
+    материалы уже скачаны локальной сессией download_case_pdfs() (или
+    вручную), достаточно перенести сами .pdf (например через Google Drive)
+    и прогнать эту функцию отдельно от скачивания."""
+    def _report(percent, message):
+        print(message)
+        if on_progress:
+            on_progress(percent, message)
+
+    os.makedirs(os.path.dirname(out_txt) or ".", exist_ok=True)
+    open(out_txt, "w", encoding="utf-8").close()
+
+    done = 0
+    for n, pdf_path in enumerate(pdf_paths, 1):
+        percent = int(100 * n / max(len(pdf_paths), 1))
+        title = os.path.splitext(os.path.basename(pdf_path))[0]
+        _report(percent, f"[{n}/{len(pdf_paths)}] {title}")
+        try:
+            text, method = extract_text(pdf_path, max_ocr_pages=max_ocr_pages)
+        except Exception as e:
+            _report(percent, f"    Ошибка извлечения текста: {e}")
+            continue
+
+        _report(percent, f"    извлечено {len(text)} символов ({method})")
+        with open(out_txt, "a", encoding="utf-8") as f:
+            f.write(f"--- {title} ---\n{text}\n\n")
+        done += 1
+
+    _report(100, f"Готово: {out_txt} ({done}/{len(pdf_paths)} PDF обработано)")
     return out_txt
+
+
+def build_case_corpus(case_url: str, out_dir: str, max_parts: Optional[int] = None,
+                       selected_indices: Optional[List[int]] = None,
+                       max_ocr_pages: Optional[int] = None,
+                       delay: float = 1.0,
+                       on_progress: Optional[Callable[[int, str], None]] = None) -> str:
+    """Удобная обёртка «скачать и сразу извлечь текст» одним вызовом —
+    для локального использования (CLI, десктопный GUI). Внутри — просто
+    download_case_pdfs() + extract_corpus_from_pdfs() подряд; если нужно
+    скачать локально, а извлечь текст отдельно (например, на Colab из
+    уже перенесённых PDF), используйте эти две функции по отдельности."""
+    pdf_paths = download_case_pdfs(case_url, out_dir, max_parts=max_parts,
+                                    selected_indices=selected_indices, delay=delay,
+                                    on_progress=on_progress)
+    out_txt = os.path.join(out_dir, "combined_source.txt")
+    return extract_corpus_from_pdfs(pdf_paths, out_txt, max_ocr_pages=max_ocr_pages,
+                                     on_progress=on_progress)
 
 
 # ---------- 5. CLI ----------
