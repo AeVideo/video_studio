@@ -53,6 +53,42 @@ def _strip_json_fence(raw: str) -> str:
     return raw.strip()
 
 
+def _parse_json_response(response, context_label: str):
+    """Общая обработка ответа DeepSeek для обоих JSON-эндпоинтов ниже.
+
+    Раньше finish_reason проверялся ТОЛЬКО когда content приходил пустым —
+    но реальный случай обрезки по max_tokens куда чаще выглядит иначе:
+    content НЕ пустой, а оборван прямо посреди строки (модель как раз
+    начала писать длинный сценарий и уткнулась в лимit на середине). Тогда
+    json.loads падает низкоуровневым "Unterminated string starting at line
+    N column M" — технически верно, но бесполезно пользователю: неясно,
+    это обрезка по токенам или реально сломанный JSON от модели. Проверяем
+    finish_reason независимо от того, пустой raw или нет, и заворачиваем
+    сам парсинг в try/except с понятным сообщением в обоих случаях."""
+    raw = _strip_json_fence(response.choices[0].message.content)
+    finish_reason = response.choices[0].finish_reason
+
+    if finish_reason == "length":
+        raise RuntimeError(
+            f"{context_label}: DeepSeek оборвал ответ по лимиту max_tokens "
+            f"(finish_reason='length'), получено {len(raw)} символов JSON, "
+            f"дальше обрезано. Увеличьте max_tokens/max_output_tokens для "
+            f"этого вызова — источник или требуемая длительность сценария "
+            f"оказались больше текущего лимита."
+        )
+    if not raw:
+        raise RuntimeError(f"{context_label}: DeepSeek вернул пустой ответ (finish_reason={finish_reason!r}).")
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"{context_label}: DeepSeek вернул невалидный JSON "
+            f"(finish_reason={finish_reason!r}): {e}. "
+            f"Начало ответа: {raw[:200]!r}"
+        ) from e
+
+
 # ---------- 1. Разбивка источника на самостоятельные истории ----------
 
 SPLIT_SYSTEM_PROMPT = """Ты — редактор документальных YouTube/TikTok каналов о расследованиях,
@@ -86,14 +122,7 @@ def split_book_into_stories(book_text: str, client: OpenAI, model: str = DEEPSEE
         # для структурированного JSON-вывода думающий режим не нужен, отключаем явно.
         extra_body={"thinking": {"type": "disabled"}},
     )
-    raw = _strip_json_fence(response.choices[0].message.content)
-    if not raw:
-        finish_reason = response.choices[0].finish_reason
-        raise RuntimeError(
-            f"DeepSeek вернул пустой ответ (finish_reason={finish_reason!r}). "
-            f"Если finish_reason == 'length' — не хватило max_tokens, увеличьте лимит."
-        )
-    return json.loads(raw)
+    return _parse_json_response(response, context_label="split_book_into_stories")
 
 
 # ---------- 2. Сценарий одной истории с учётом длительности ----------
@@ -229,14 +258,7 @@ def write_script_for_story(
         # съедает max_output_tokens на рассуждения и content приходит пустым
         extra_body={"thinking": {"type": "disabled"}},
     )
-    raw = _strip_json_fence(response.choices[0].message.content)
-    if not raw:
-        finish_reason = response.choices[0].finish_reason
-        raise RuntimeError(
-            f"DeepSeek вернул пустой ответ (finish_reason={finish_reason!r}). "
-            f"Если finish_reason == 'length' — не хватило max_tokens, увеличьте лимит."
-        )
-    return json.loads(raw)
+    return _parse_json_response(response, context_label="write_script_for_story")
 
 
 # ---------- 3. CLI ----------

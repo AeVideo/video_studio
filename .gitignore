@@ -29,3 +29,5 @@ browser_profiles/
 
 # Локальный VIDEO_STUDIO_HOME по умолчанию, если создаётся рядом с репо
 video_studio_home/
+projects/
+projects/
