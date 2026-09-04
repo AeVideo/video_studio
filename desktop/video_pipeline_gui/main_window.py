@@ -350,6 +350,14 @@ class MainWindow(QMainWindow):
         self.screen_volume_selection.set_volumes(result)
 
     def _on_volumes_selected(self, selected_indices, max_ocr_pages):
+        # Защита от повторного входа на уровне логики (не только UI) — если
+        # предыдущий CaseScrapeWorker ещё не завершился, новый не запускаем.
+        # Именно рассинхрон "кнопка кликабельна, пока воркер уже работает"
+        # приводил к нескольким параллельным скрейпам одного дела, писавшим
+        # в один и тот же combined_source.txt (см. screens.py::_on_download_clicked).
+        if getattr(self, "_worker", None) is not None and self._worker.isRunning():
+            return
+
         worker = CaseScrapeWorker(
             self._pending_case_url, self._pending_project_dir,
             selected_indices=selected_indices, max_ocr_pages=max_ocr_pages,
@@ -360,6 +368,8 @@ class MainWindow(QMainWindow):
 
     def _on_case_scraped(self, success, result):
         if not success:
+            self.screen_volume_selection.download_btn.setEnabled(True)
+            self.screen_volume_selection.status_label.setText("Ошибка скачивания — можно попробовать ещё раз.")
             QMessageBox.critical(self, "Ошибка скачивания дела", result)
             return
         # result — combined_source.txt; дальше используем как обычный book_path

@@ -296,6 +296,13 @@ class VolumeSelectionScreen(QWidget):
         if not selected_indices:
             QMessageBox.warning(self, "Выберите тома", "Отметьте хотя бы один том для скачивания.")
             return
+        # Немедленно блокируем кнопку — без этого повторный клик до появления
+        # прогресса (а прогресса тут не видно, только лог) запускает второй
+        # параллельный CaseScrapeWorker поверх первого, и оба пишут в один и
+        # тот же combined_source.txt, затирая друг друга. main_window.py
+        # включит кнопку обратно в _on_case_scraped(), когда воркер завершится.
+        self.download_btn.setEnabled(False)
+        self.status_label.setText("Скачиваю материалы дела — это может занять несколько минут...")
         max_pages = self.max_ocr_pages.value()
         max_pages = None if max_pages == 0 else max_pages  # 0 = "без ограничения"
         self.download_requested.emit(selected_indices, max_pages)
