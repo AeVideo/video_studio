@@ -156,14 +156,38 @@ def run_script_stage(book_file, book_text_preview, duration_minutes, language,
         json.dump(script, f, ensure_ascii=False, indent=2)
 
     narration_path = os.path.join(out_dir, "narration_text.txt")
+    narration_text = "\n\n".join(s["text"] for s in script)
     with open(narration_path, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(s["text"] for s in script))
+        f.write(narration_text)
 
     progress(1.0, desc="Готово")
     preview = "\n\n".join(f"[{s.get('timestamp', '?')}] {s['text']}" for s in script[:5])
-    return (f"Сценарий сохранён: {script_path}\n"
-            f"В бэклоге осталось историй: {len(backlog)}\n\n"
-            f"Первые реплики:\n{preview}")
+    status = (f"Сценарий сохранён: {script_path}\n"
+              f"Текст диктора сохранён: {narration_path}\n"
+              f"В бэклоге осталось историй: {len(backlog)}\n\n"
+              f"Первые реплики:\n{preview}")
+    # narration_text и project_id уходят на вкладку "Субтитры" (см. .click outputs
+    # ниже) — без этого пришлось бы вручную искать narration_text.txt на диске.
+    return status, narration_text, project_id
+
+
+# ---------------------------------------------------------------------------
+# Автоподтяжка текста диктора на вкладке "Субтитры" по имени проекта.
+# Озвучка (ElevenLabs) пока делается вручную вне video_studio (нет API-ключа) —
+# аудио всё ещё грузится файлом руками. Но narration_text.txt уже лежит на
+# диске сразу после вкладки "Сценарий" — эту часть автоматизируем полностью:
+# копировать/искать файл руками для сверки больше не нужно.
+# ---------------------------------------------------------------------------
+
+def find_reference_text(project_id):
+    if not project_id:
+        return "Имя проекта не указано — эталонный текст не подтянут, вычитка выключена.", None
+    path = os.path.join(PROJECTS_ROOT, project_id, "narration_text.txt")
+    if not os.path.exists(path):
+        return f"Для проекта «{project_id}» не найден narration_text.txt ({path}).", None
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    return f"Эталонный текст найден автоматически: {path} ({len(text)} символов).", path
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +197,7 @@ def run_script_stage(book_file, book_text_preview, duration_minutes, language,
 # (режим A, один процесс — см. COLAB_MIGRATION_PLAN.md, раздел 3.2).
 # ---------------------------------------------------------------------------
 
-def run_subtitles_stage(audio_file, reference_text_file, language, model,
+def run_subtitles_stage(audio_file, reference_text_file, auto_reference_path, language, model,
                          progress=gr.Progress()):
     if audio_file is None:
         raise gr.Error("Загрузите аудио/видео с озвучкой")
@@ -191,12 +215,18 @@ def run_subtitles_stage(audio_file, reference_text_file, language, model,
         device=device, on_progress=on_progress,
     )
 
-    if reference_text_file is not None:
-        progress(0.95, desc="Сверяю с эталонным текстом...")
-        fixed_srt_path = run_proofread(raw_srt_path, reference_text_file.name)
-        return fixed_srt_path, f"Готово (устройство: {device}, модель: {model}). Вычитано по эталону."
+    # Загруженный вручную файл — приоритетнее (например, сверяем по другому
+    # проекту или по тексту, который не совпадает с narration_text.txt).
+    # Если ничего не загружено — используем то, что нашлось автоматически
+    # по имени проекта (см. find_reference_text/project_id_box).
+    reference_path = reference_text_file.name if reference_text_file is not None else auto_reference_path
 
-    return raw_srt_path, f"Готово (устройство: {device}, модель: {model}). Без вычитки — эталонный текст не загружен."
+    if reference_path:
+        progress(0.95, desc="Сверяю с эталонным текстом...")
+        fixed_srt_path = run_proofread(raw_srt_path, reference_path)
+        return fixed_srt_path, f"Готово (устройство: {device}, модель: {model}). Вычитано по эталону ({reference_path})."
+
+    return raw_srt_path, f"Готово (устройство: {device}, модель: {model}). Без вычитки — эталонный текст не найден."
 
 
 # ---------------------------------------------------------------------------
@@ -282,18 +312,26 @@ def build_app() -> gr.Blocks:
             project_id = gr.Textbox(label="Имя проекта (папка в PROJECTS_ROOT)")
             script_btn = gr.Button("Сгенерировать сценарий", variant="primary")
             script_out = gr.Textbox(label="Результат", lines=10)
-            script_btn.click(
-                run_script_stage,
-                inputs=[book_file, book_text_preview, duration_minutes, language, project_id, content_mode],
-                outputs=script_out,
+            narration_preview = gr.Textbox(
+                label="Текст диктора (narration_text.txt) — скопируйте отсюда для ручной озвучки",
+                lines=10, show_copy_button=True,
             )
 
         with gr.Tab("2. Субтитры (GPU)"):
             gr.Markdown(f"Устройство по умолчанию сейчас: **{default_device()}**, "
                         f"модель по умолчанию: **{default_model()}** "
                         "(base на CPU — тайминги, точный текст всё равно из вычитки; large-v3 на GPU)")
-            audio_file = gr.File(label="Аудио/видео с озвучкой")
-            reference_text_file = gr.File(label="Эталонный текст (narration_text.txt) — опционально, для вычитки")
+            audio_file = gr.File(label="Аудио/видео с озвучкой — озвучка пока делается вручную вне video_studio")
+            project_id_2 = gr.Textbox(
+                label="Имя проекта",
+                info="То же имя, что на вкладке «Сценарий» — подставляется само; можно ввести вручную "
+                     "(например, при возврате к проекту в новой сессии Colab).",
+            )
+            auto_reference_status = gr.Textbox(label="Эталонный текст — автопоиск по проекту", interactive=False)
+            auto_reference_path = gr.State(None)
+            reference_text_file = gr.File(
+                label="Эталонный текст вручную (перекрывает автопоиск выше — необязательно)"
+            )
             with gr.Row():
                 sub_language = gr.Dropdown(["ru", "en", "Auto"], value="ru", label="Язык")
                 sub_model = gr.Dropdown(
@@ -305,7 +343,7 @@ def build_app() -> gr.Blocks:
             subs_status_out = gr.Textbox(label="Статус")
             subs_btn.click(
                 run_subtitles_stage,
-                inputs=[audio_file, reference_text_file, sub_language, sub_model],
+                inputs=[audio_file, reference_text_file, auto_reference_path, sub_language, sub_model],
                 outputs=[subs_file_out, subs_status_out],
             )
 
@@ -324,6 +362,24 @@ def build_app() -> gr.Blocks:
                 "`core.assembly.assemble_video`. Скачиваемый результат — через `gr.File`, "
                 "как в вкладке «Субтитры» выше."
             )
+
+        # ------------------------------------------------------------------
+        # Связка вкладок 1 -> 2: project_id и narration_text.txt раньше нужно
+        # было носить между вкладками вручную (см. историю в чате/памяти).
+        # Теперь: после генерации сценария имя проекта само подставляется на
+        # вкладку "Субтитры" и оттуда автоматически подтягивается эталонный
+        # текст для сверки с распознаванием whisper.
+        # ------------------------------------------------------------------
+        script_btn.click(
+            run_script_stage,
+            inputs=[book_file, book_text_preview, duration_minutes, language, project_id, content_mode],
+            outputs=[script_out, narration_preview, project_id_2],
+        )
+        project_id_2.change(
+            find_reference_text,
+            inputs=project_id_2,
+            outputs=[auto_reference_status, auto_reference_path],
+        )
 
     return demo
 
