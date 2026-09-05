@@ -17,15 +17,14 @@ Web-интерфейс поверх той же бизнес-логики, чт�
 (уже включено ниже, если запущено вне интерактивного локального запуска —
 см. IN_COLAB) для публичной ссылки без отдельного деплоя.
 
-Готовые вкладки (Phase 2, TASK W-01/W-02):
+Готовые вкладки:
     - Источник → Сценарий   (core/script/book_to_script.py; источник — файл
       .txt ИЛИ дело FBI Vault через scraping/, см. IN_COLAB ниже)
     - Субтитры               (asr/transcribe.py, GPU по умолчанию на Colab)
-
-Остальные стадии (Phase 2, TASK W-03/W-04 — подбор видео, сборка) НЕ
-портированы в этом файле — оставлены как заготовки-вкладки с пометкой
-TODO, по тому же паттерну адаптера. Портировать их — механическая работа,
-не архитектурная (см. пример ниже).
+    - Подбор видео            (core/video_sources/pexels_matcher.py + archive_org_search,
+      адаптер поверх desktop/video_pipeline_gui/workers.py::MatchWorker)
+    - Сборка                  (core/assembly/assemble_video.py,
+      адаптер поверх desktop/video_pipeline_gui/workers.py::AssembleWorker)
 """
 import json
 import os
@@ -35,7 +34,10 @@ import gradio as gr
 
 from config.paths import PROJECTS_ROOT, VIDEO_STUDIO_HOME
 from core.script import book_to_script
+from core.video_sources import pexels_matcher
+from core.assembly import assemble_video
 from asr.transcribe import run_transcribe, run_proofread, default_device, default_model
+from asr import style_manager
 
 IN_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
 
@@ -200,6 +202,145 @@ def run_subtitles_stage(audio_file, reference_text_file, language, model,
 
 
 # ---------------------------------------------------------------------------
+# Вкладка 3: Подбор видео (TASK W-03)
+# Соответствует desktop/video_pipeline_gui/workers.py::MatchWorker.run() —
+# та же последовательность вызовов pexels_matcher, тот же инкрементальный
+# _save_partial после каждого шота (см. COLAB_MIGRATION_PLAN.md/REFACTOR_PLAN.md
+# — resume и защита от потери прогресса при отмене на середине).
+# ---------------------------------------------------------------------------
+
+def _save_partial_matching(out_path, data, results):
+    payload = {
+        "audio_path": data.get("audio_path"),
+        "srt_path": data.get("srt_path"),
+        "scenes": results,
+    }
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, out_path)
+
+
+def run_matching_stage(shots_file, aspect_ratio, progress=gr.Progress()):
+    if shots_file is None:
+        raise gr.Error("Загрузите shots.json (результат этапа «Сцены → Шоты»)")
+
+    pexels_key = os.environ.get("PEXELS_API_KEY")
+    pixabay_key = os.environ.get("PIXABAY_API_KEY")
+    if not pexels_key:
+        raise gr.Error("PEXELS_API_KEY не задан (.env локально / Colab Secrets на Colab)")
+
+    orientation = "portrait" if aspect_ratio == "9:16" else "landscape"
+
+    with open(shots_file.name, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    scenes = data["scenes"]
+
+    out_dir = tempfile.mkdtemp(prefix="matching_")
+    out_path = os.path.join(out_dir, "footage.json")
+
+    progress(0.0, desc="Загружаю CLIP и подключаюсь к DeepSeek...")
+    deepseek_client = pexels_matcher.get_deepseek_client()
+    clip_scorer = pexels_matcher.ClipScorer()  # кэшируется на уровне класса — повторные вызовы дёшевы
+    used_ids = set()
+    thumbnails_dir = os.path.join(out_dir, pexels_matcher.THUMBNAILS_DIR_NAME)
+
+    archive_pool = []
+    archive_dead_ids = set()
+    if pexels_matcher.archive_org_search is not None:
+        story_summary = " ".join(s["text"] for s in scenes)[:2000]
+        theme_queries = pexels_matcher.generate_archive_theme_queries(story_summary, deepseek_client)
+        if theme_queries:
+            archive_pool = pexels_matcher.archive_org_search.find_theme_pool(theme_queries)
+
+    results = []
+    for i, scene in enumerate(scenes, 1):
+        progress(i / max(len(scenes), 1), desc=f"[{i}/{len(scenes)}] {scene['id']}")
+        matched = pexels_matcher.match_scene(
+            scene, deepseek_client, clip_scorer, pexels_key, used_ids,
+            pixabay_key=pixabay_key, thumbnails_dir=thumbnails_dir,
+            orientation=orientation, archive_pool=archive_pool,
+            archive_dead_ids=archive_dead_ids,
+        )
+        results.append(matched)
+        _save_partial_matching(out_path, data, results)  # инкрементально — тот же паттерн, что MatchWorker
+
+    if not scenes:
+        _save_partial_matching(out_path, data, results)
+
+    progress(1.0, desc="Готово")
+    return out_path, f"Подобрано видео для {len(results)}/{len(scenes)} шотов -> {out_path}"
+
+
+# ---------------------------------------------------------------------------
+# Вкладка 4: Сборка (TASK W-04)
+# Соответствует desktop/video_pipeline_gui/workers.py::AssembleWorker.run().
+# ---------------------------------------------------------------------------
+
+def run_assembly_stage(footage_file, audio_file, subtitles_file, style_slug,
+                        aspect_ratio, progress=gr.Progress()):
+    if footage_file is None:
+        raise gr.Error("Загрузите footage.json (результат этапа «Подбор видео»)")
+    if audio_file is None:
+        raise gr.Error("Загрузите файл озвучки")
+
+    target_width, target_height = assemble_video.ASPECT_RATIOS[aspect_ratio]
+
+    with open(footage_file.name, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    scenes = data["scenes"]
+
+    work_dir = tempfile.mkdtemp(prefix="video_assembly_")
+    clip_paths, durations = [], []
+
+    for i, scene in enumerate(scenes):
+        footage = scene.get("footage")
+        if not footage:
+            continue
+        duration = round(scene["end"] - scene["start"], 2)
+        if duration <= 0:
+            continue
+
+        progress(0.05 + 0.7 * (i + 1) / max(len(scenes), 1),
+                  desc=f"[{i + 1}/{len(scenes)}] {scene['id']}: обрабатываю клип...")
+        raw_path = os.path.join(work_dir, f"raw_{i}.mp4")
+        norm_path = os.path.join(work_dir, f"norm_{i}.mp4")
+        padded = round(duration + assemble_video.CROSSFADE_SEC, 2)
+
+        assemble_video.download_clip(footage["video_link"], raw_path)
+        assemble_video.normalize_clip(
+            raw_path, norm_path, padded,
+            offset=footage.get("best_offset", 0.0),
+            source_duration=footage.get("duration", 0.0),
+            target_width=target_width, target_height=target_height,
+        )
+        clip_paths.append(norm_path)
+        durations.append(padded)
+
+    if not clip_paths:
+        raise gr.Error("Нет ни одного клипа для сборки — проверьте footage.json")
+
+    out_path = os.path.join(work_dir, "final.mp4")
+
+    progress(0.78, desc="Склеиваю клипы с кроссфейдом...")
+    concat_path = os.path.join(work_dir, "concat.mp4")
+    assemble_video.build_crossfade_chain(clip_paths, durations, concat_path)
+
+    progress(0.88, desc="Накладываю озвучку...")
+    if subtitles_file is not None:
+        muxed_path = os.path.join(work_dir, "muxed.mp4")
+        assemble_video.mux_audio(concat_path, audio_file.name, muxed_path)
+        progress(0.94, desc="Прожигаю субтитры...")
+        slug = style_slug if style_slug and style_slug != "(без стиля по умолчанию)" else None
+        assemble_video.burn_subtitles(muxed_path, subtitles_file.name, out_path, style_slug=slug)
+    else:
+        assemble_video.mux_audio(concat_path, audio_file.name, out_path)
+
+    progress(1.0, desc="Готово")
+    return out_path, f"Собрано: {out_path} ({len(clip_paths)} клипов)"
+
+
+# ---------------------------------------------------------------------------
 # Сборка интерфейса
 # ---------------------------------------------------------------------------
 
@@ -208,7 +349,7 @@ def build_app() -> gr.Blocks:
         gr.Markdown(
             "# video_studio\n"
             "Web-интерфейс поверх той же логики, что и десктопные GUI. "
-            "Подбор видео и сборка — следующие вкладки (TASK W-03/W-04, см. COLAB_MIGRATION_PLAN.md)."
+            "Все четыре стадии рабочие: Сценарий → Субтитры → Подбор видео → Сборка."
         )
 
         with gr.Tab("1. Источник → Сценарий"):
@@ -309,20 +450,52 @@ def build_app() -> gr.Blocks:
                 outputs=[subs_file_out, subs_status_out],
             )
 
-        with gr.Tab("3. Подбор видео (TODO — TASK W-03)"):
+        with gr.Tab("3. Подбор видео"):
             gr.Markdown(
-                "Заготовка. По тому же паттерну, что вкладки 1-2: адаптер вокруг "
-                "`desktop/video_pipeline_gui/workers.py::MatchWorker`, вызывающий "
-                "`core.video_sources.pexels_matcher` / `archive_org_search` напрямую. "
-                "ClipScorer уже кэшируется на уровне класса — просто переиспользовать "
-                "тот же инстанс между вызовами Gradio, не пересоздавать на каждый клик."
+                "Подбор по каждому шоту (Pexels/Pixabay/Archive.org + CLIP-скоринг). "
+                "Прогресс сохраняется инкрементально после каждого шота — как и в десктопном "
+                "GUI (см. `MatchWorker._save_partial`), при обрыве прогона отдать частично "
+                "готовый `footage.json` не проблема."
+            )
+            shots_file = gr.File(label="shots.json (результат этапа «Сцены → Шоты»)")
+            match_aspect = gr.Dropdown(["16:9", "9:16"], value="16:9", label="Соотношение сторон")
+            match_btn = gr.Button("Подобрать видео", variant="primary")
+            match_file_out = gr.File(label="footage.json")
+            match_status_out = gr.Textbox(label="Статус")
+            match_btn.click(
+                run_matching_stage, inputs=[shots_file, match_aspect],
+                outputs=[match_file_out, match_status_out],
             )
 
-        with gr.Tab("4. Сборка (TODO — TASK W-04)"):
-            gr.Markdown(
-                "Заготовка. Адаптер вокруг `AssembleWorker` -> "
-                "`core.assembly.assemble_video`. Скачиваемый результат — через `gr.File`, "
-                "как в вкладке «Субтитры» выше."
+        with gr.Tab("4. Сборка"):
+            gr.Markdown("Финальная склейка: кроссфейд между клипами, наложение озвучки, прожиг субтитров.")
+            footage_file = gr.File(label="footage.json (результат этапа «Подбор видео»)")
+            assembly_audio_file = gr.File(label="Аудио озвучки")
+            assembly_subs_file = gr.File(label="Субтитры (.srt/.ass) — опционально, без них прожига не будет")
+
+            try:
+                style_choices = ["(без стиля по умолчанию)"] + [
+                    f"{slug}::{name}" for slug, name in style_manager.list_styles()
+                ]
+            except Exception:
+                style_choices = ["(без стиля по умолчанию)"]
+
+            with gr.Row():
+                assembly_style = gr.Dropdown(style_choices, value=style_choices[0], label="Стиль субтитров")
+                assembly_aspect = gr.Dropdown(["16:9", "9:16"], value="16:9", label="Соотношение сторон")
+
+            assembly_btn = gr.Button("Собрать видео", variant="primary")
+            assembly_file_out = gr.File(label="Готовое видео")
+            assembly_status_out = gr.Textbox(label="Статус")
+
+            def _run_assembly_wrapper(footage_file, audio_file, subs_file, style_choice, aspect, progress=gr.Progress()):
+                slug = style_choice.split("::", 1)[0] if style_choice and "::" in style_choice else None
+                return run_assembly_stage(footage_file, audio_file, subs_file, slug, aspect, progress=progress)
+
+            assembly_btn.click(
+                _run_assembly_wrapper,
+                inputs=[footage_file, assembly_audio_file, assembly_subs_file, assembly_style, assembly_aspect],
+                outputs=[assembly_file_out, assembly_status_out],
             )
 
     return demo
