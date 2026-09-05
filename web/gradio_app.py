@@ -34,6 +34,7 @@ import gradio as gr
 
 from config.paths import PROJECTS_ROOT, VIDEO_STUDIO_HOME
 from core.script import book_to_script
+from core.scenes import srt_to_scenes, scenes_to_shots
 from core.video_sources import pexels_matcher
 from core.assembly import assemble_video
 from asr.transcribe import run_transcribe, run_proofread, default_device, default_model
@@ -199,6 +200,53 @@ def run_subtitles_stage(audio_file, reference_text_file, language, model,
         return fixed_srt_path, f"Готово (устройство: {device}, модель: {model}). Вычитано по эталону."
 
     return raw_srt_path, f"Готово (устройство: {device}, модель: {model}). Без вычитки — эталонный текст не загружен."
+
+
+# ---------------------------------------------------------------------------
+# Вкладка 3: Сцены -> Шоты
+# Соответствует desktop/video_pipeline_gui/workers.py::ShotExpansionWorker.run().
+# Раньше в Gradio отсутствовала целиком — shots.json неоткуда было взять.
+# ---------------------------------------------------------------------------
+
+def run_shots_stage(script_file, srt_file, audio_file, progress=gr.Progress()):
+    if script_file is None or srt_file is None:
+        raise gr.Error("Загрузите script.json (этап «Сценарий») и .srt (этап «Субтитры»)")
+
+    progress(0.1, desc="Читаю сценарий и субтитры...")
+    with open(script_file.name, "r", encoding="utf-8") as f:
+        script_scenes = json.load(f)
+
+    cues = srt_to_scenes.parse_srt(srt_file.name)
+    words = srt_to_scenes.cues_to_word_timings(cues)
+
+    progress(0.4, desc="Привязываю сцены к реальным таймингам речи...")
+    timed = srt_to_scenes.align_scenes_to_words(script_scenes, words)
+    timed_dicts = [s.__dict__ for s in timed]
+
+    progress(0.7, desc="Разворачиваю сцены в шоты...")
+    visuals_by_id = {s["id"]: s.get("visuals", []) for s in script_scenes}
+    all_shots = []
+    for scene in timed_dicts:
+        if scene.get("status") == "missing" or scene.get("start") is None:
+            continue
+        visuals = visuals_by_id.get(scene["id"], [])
+        all_shots.extend(scenes_to_shots.expand_scene_to_shots(scene, visuals))
+
+    if not all_shots:
+        raise gr.Error(
+            "Не получилось развернуть ни одной сцены в шоты — проверьте, что "
+            ".srt реально соответствует тексту сценария (те же реплики)."
+        )
+
+    out_dir = tempfile.mkdtemp(prefix="shots_")
+    shots_path = os.path.join(out_dir, "shots_timed.json")
+    audio_path_value = audio_file.name if audio_file is not None else None
+    with open(shots_path, "w", encoding="utf-8") as f:
+        json.dump({"audio_path": audio_path_value, "srt_path": srt_file.name, "scenes": all_shots},
+                   f, ensure_ascii=False, indent=2)
+
+    progress(1.0, desc="Готово")
+    return shots_path, f"Развёрнуто {len(all_shots)} шотов из {len(timed_dicts)} сцен -> {shots_path}"
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +498,23 @@ def build_app() -> gr.Blocks:
                 outputs=[subs_file_out, subs_status_out],
             )
 
-        with gr.Tab("3. Подбор видео"):
+        with gr.Tab("3. Сцены → Шоты"):
+            gr.Markdown(
+                "Привязывает реплики сценария к реальным таймингам речи из .srt и разворачивает "
+                "каждую сцену в отдельные шоты. Результат (`shots.json`) идёт на вход вкладке «Подбор видео»."
+            )
+            shots_script_file = gr.File(label="script.json (этап «Сценарий»)")
+            shots_srt_file = gr.File(label=".srt (этап «Субтитры»)")
+            shots_audio_file = gr.File(label="Аудио озвучки — опционально, просто сохраняется как метаданные")
+            shots_btn = gr.Button("Развернуть в шоты", variant="primary")
+            shots_file_out = gr.File(label="shots.json")
+            shots_status_out = gr.Textbox(label="Статус")
+            shots_btn.click(
+                run_shots_stage, inputs=[shots_script_file, shots_srt_file, shots_audio_file],
+                outputs=[shots_file_out, shots_status_out],
+            )
+
+        with gr.Tab("4. Подбор видео"):
             gr.Markdown(
                 "Подбор по каждому шоту (Pexels/Pixabay/Archive.org + CLIP-скоринг). "
                 "Прогресс сохраняется инкрементально после каждого шота — как и в десктопном "
@@ -467,7 +531,7 @@ def build_app() -> gr.Blocks:
                 outputs=[match_file_out, match_status_out],
             )
 
-        with gr.Tab("4. Сборка"):
+        with gr.Tab("5. Сборка"):
             gr.Markdown("Финальная склейка: кроссфейд между клипами, наложение озвучки, прожиг субтитров.")
             footage_file = gr.File(label="footage.json (результат этапа «Подбор видео»)")
             assembly_audio_file = gr.File(label="Аудио озвучки")
