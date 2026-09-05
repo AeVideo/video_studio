@@ -51,9 +51,23 @@ USER_DATA_DIR = os.path.join(VIDEO_STUDIO_HOME, "user_data")
 USER_STYLES_DIR = os.path.join(USER_DATA_DIR, "styles")
 SCRAPER_CACHE_DIR = os.path.join(USER_DATA_DIR, "scraper_cache")
 
+def _ensure_dir(path: str) -> None:
+    """os.makedirs(path, exist_ok=True) кидает FileExistsError, если по
+    этому пути уже лежит НЕ директория — битый симлинк (например, остаток
+    ручного костыля вида `ln -s /tmp/... .../api_jobs`, а /tmp на Colab
+    пропадает при пересоздании рантайма) или файл. Наблюдалось на практике
+    дважды подряд на Colab в одном и том же месте (output/api_jobs) — не
+    гипотетический край, реальный повторяющийся случай. Расчищаем такой
+    путь перед созданием директории, вместо того чтобы падать на импорте
+    всего пакета с невнятным traceback ещё до старта приложения."""
+    if os.path.islink(path) or (os.path.exists(path) and not os.path.isdir(path)):
+        os.remove(path)
+    os.makedirs(path, exist_ok=True)
+
+
 for _dir in (PROJECTS_ROOT, OUTPUT_DIR, LOGS_DIR, MODELS_CACHE_DIR, API_JOBS_DIR,
              USER_DATA_DIR, USER_STYLES_DIR, SCRAPER_CACHE_DIR):
-    os.makedirs(_dir, exist_ok=True)
+    _ensure_dir(_dir)
 
 
 def crash_log_path() -> str:
