@@ -16,6 +16,7 @@ asr/transcribe.py
 import os
 import re
 import subprocess
+import shutil
 import sys
 import uuid
 from typing import Callable, Optional
@@ -24,11 +25,18 @@ from config.paths import API_JOBS_DIR
 
 
 def default_whisper_exe() -> str:
-    """sys.executable внутри уже запущенного процесса всегда указывает на
-    python текущего venv, а whisper лежит в той же папке bin/ — берём его
-    оттуда, а не полагаемся на PATH (см. исходный комментарий в
-    subtitle_service.py — актуален и здесь)."""
-    return os.path.join(os.path.dirname(sys.executable), "whisper")
+    """Предпочитаем shutil.which("whisper") — он корректно находит бинарник
+    и в venv (.venv/bin/whisper), и при глобальной установке без venv, как
+    на Colab, где pip кладёт консольные скрипты в /usr/local/bin, а не рядом
+    с sys.executable (там просто /usr/bin/python3). Старая логика
+    (os.path.dirname(sys.executable) + "/whisper") предполагала, что
+    whisper всегда лежит рядом с venv-питоном — верно для локальной машины,
+    но ломалось на Colab с FileNotFoundError. Оставлена как fallback на
+    случай, если PATH почему-то не содержит нужный каталог (никогда не
+    откатываемся на sys.executable как таковой — это путь к интерпретатору
+    Python, не к whisper, и попытка его исполнить с аргументами whisper
+    провалится ещё более непонятной ошибкой)."""
+    return shutil.which("whisper") or os.path.join(os.path.dirname(sys.executable), "whisper")
 
 
 def default_device() -> str:
