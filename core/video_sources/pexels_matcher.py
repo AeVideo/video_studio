@@ -28,6 +28,7 @@ pexels_matcher.py
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import time
@@ -475,13 +476,28 @@ class ClipScorer:
             return False
 
     def score_candidate(self, candidate: Dict, text_embedding: torch.Tensor) -> Optional[Dict]:
+        # ВАЖНО: раньше картинки скачивались и эмбеддились строго по одной,
+        # последовательно — до 10 картинок x 8 кандидатов x 4 запроса на
+        # сцену, в худшем случае до 320 последовательных HTTP-запросов на
+        # ОДИН шот. CLIP-форвард занимает миллисекунды, реальное узкое место
+        # всегда было в сетевом ожидании, а не в вычислениях — GPU тут было
+        # физически нечего ускорять, отсюда ~49 сек/шот даже после того, как
+        # GPU-путь для CLIP заработал. requests.get() отпускает GIL на время
+        # ожидания ответа, поэтому ThreadPoolExecutor здесь даёт реальный
+        # параллелизм, а не иллюзию — ускоряет одинаково и на CPU, и на GPU.
         similarities = []  # список (индекс_кадра, схожесть)
-        for idx, pic_url in enumerate(candidate["pictures"]):
-            img_emb = self.embed_image_url(pic_url)
-            if img_emb is None:
-                continue
-            sim = (img_emb @ text_embedding.T).item()
-            similarities.append((idx, sim))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(self.embed_image_url, pic_url): idx
+                for idx, pic_url in enumerate(candidate["pictures"])
+            }
+            for future in concurrent.futures.as_completed(futures):
+                idx = futures[future]
+                img_emb = future.result()
+                if img_emb is None:
+                    continue
+                sim = (img_emb @ text_embedding.T).item()
+                similarities.append((idx, sim))
 
         if not similarities:
             return None
