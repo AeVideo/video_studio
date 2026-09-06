@@ -26,6 +26,8 @@ Web-интерфейс поверх той же бизнес-логики, чт�
     - Сборка                  (core/assembly/assemble_video.py,
       адаптер поверх desktop/video_pipeline_gui/workers.py::AssembleWorker)
 """
+import contextlib
+import io
 import json
 import os
 import uuid
@@ -56,6 +58,37 @@ def _persistent_workdir(prefix: str) -> str:
     path = os.path.join(OUTPUT_DIR, f"{prefix}_{uuid.uuid4().hex}")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+class _ProgressStdout(io.StringIO):
+    """Перехватывает print() из core/video_sources/pexels_matcher.py и
+    показывает последнюю строку прямо в прогресс-баре Gradio.
+
+    Внутри одной сцены match_scene() может делать десятки-сотни сетевых
+    запросов (несколько запросов x несколько кандидатов x несколько картинок
+    на кандидата) — весь этот путь уже был усыпан print() для CLI/десктопного
+    GUI (какой кандидат, какой score, retry по низкой уверенности), но эти
+    строки печатались в stdout фонового процесса Colab, а не в интерфейс —
+    пользователь видел молчащий спиннер по 3-5 минут на тяжёлую сцену без
+    единого признака, что вообще происходит. Теперь та же самая печать
+    отражается в описании прогресса в реальном времени."""
+
+    def __init__(self, progress_fn, base_percent: float):
+        super().__init__()
+        self.progress_fn = progress_fn
+        self.base_percent = base_percent
+
+    def write(self, s):
+        line = s.strip()
+        if line:
+            self.progress_fn(self.base_percent, desc=line[:200])
+        return super().write(s)
+
+
+@contextlib.contextmanager
+def _progress_stdout(progress_fn, base_percent: float):
+    with contextlib.redirect_stdout(_ProgressStdout(progress_fn, base_percent)):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -311,20 +344,24 @@ def run_matching_stage(shots_file, aspect_ratio, progress=gr.Progress()):
     archive_pool = []
     archive_dead_ids = set()
     if pexels_matcher.archive_org_search is not None:
+        progress(0.02, desc="Ищу тематические подборки в Archive.org...")
         story_summary = " ".join(s["text"] for s in scenes)[:2000]
-        theme_queries = pexels_matcher.generate_archive_theme_queries(story_summary, deepseek_client)
-        if theme_queries:
-            archive_pool = pexels_matcher.archive_org_search.find_theme_pool(theme_queries)
+        with _progress_stdout(progress, 0.02):
+            theme_queries = pexels_matcher.generate_archive_theme_queries(story_summary, deepseek_client)
+            if theme_queries:
+                archive_pool = pexels_matcher.archive_org_search.find_theme_pool(theme_queries)
 
     results = []
     for i, scene in enumerate(scenes, 1):
-        progress(i / max(len(scenes), 1), desc=f"[{i}/{len(scenes)}] {scene['id']}")
-        matched = pexels_matcher.match_scene(
-            scene, deepseek_client, clip_scorer, pexels_key, used_ids,
-            pixabay_key=pixabay_key, thumbnails_dir=thumbnails_dir,
-            orientation=orientation, archive_pool=archive_pool,
-            archive_dead_ids=archive_dead_ids,
-        )
+        base_percent = i / max(len(scenes), 1)
+        progress(base_percent, desc=f"[{i}/{len(scenes)}] {scene['id']}: начинаю подбор...")
+        with _progress_stdout(progress, base_percent):
+            matched = pexels_matcher.match_scene(
+                scene, deepseek_client, clip_scorer, pexels_key, used_ids,
+                pixabay_key=pixabay_key, thumbnails_dir=thumbnails_dir,
+                orientation=orientation, archive_pool=archive_pool,
+                archive_dead_ids=archive_dead_ids,
+            )
         results.append(matched)
         _save_partial_matching(out_path, data, results)  # инкрементально — тот же паттерн, что MatchWorker
 
@@ -370,13 +407,15 @@ def run_assembly_stage(footage_file, audio_file, subtitles_file, style_slug,
         norm_path = os.path.join(work_dir, f"norm_{i}.mp4")
         padded = round(duration + assemble_video.CROSSFADE_SEC, 2)
 
-        assemble_video.download_clip(footage["video_link"], raw_path)
-        assemble_video.normalize_clip(
-            raw_path, norm_path, padded,
-            offset=footage.get("best_offset", 0.0),
-            source_duration=footage.get("duration", 0.0),
-            target_width=target_width, target_height=target_height,
-        )
+        base_percent = 0.05 + 0.7 * (i + 1) / max(len(scenes), 1)
+        with _progress_stdout(progress, base_percent):
+            assemble_video.download_clip(footage["video_link"], raw_path)
+            assemble_video.normalize_clip(
+                raw_path, norm_path, padded,
+                offset=footage.get("best_offset", 0.0),
+                source_duration=footage.get("duration", 0.0),
+                target_width=target_width, target_height=target_height,
+            )
         clip_paths.append(norm_path)
         durations.append(padded)
 
