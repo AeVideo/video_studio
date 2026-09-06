@@ -28,11 +28,11 @@ Web-интерфейс поверх той же бизнес-логики, чт�
 """
 import json
 import os
-import tempfile
+import uuid
 
 import gradio as gr
 
-from config.paths import PROJECTS_ROOT, VIDEO_STUDIO_HOME
+from config.paths import PROJECTS_ROOT, VIDEO_STUDIO_HOME, OUTPUT_DIR
 from core.script import book_to_script
 from core.scenes import srt_to_scenes, scenes_to_shots
 from core.video_sources import pexels_matcher
@@ -41,6 +41,21 @@ from asr.transcribe import run_transcribe, run_proofread, default_device, defaul
 from asr import style_manager
 
 IN_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
+
+
+def _persistent_workdir(prefix: str) -> str:
+    """Рабочая папка под VIDEO_STUDIO_HOME (Google Drive на Colab), а не
+    tempfile.mkdtemp() в системный /tmp. Разница критична именно на Colab:
+    соединение через google.colab.kernel.proxyPort нестабильно на долгих
+    операциях (подбор видео, сборка) и может оборваться посреди прогона —
+    'Broken Connection'. Если результат в /tmp, оборванное соединение
+    означает потерю уже сделанной работы без единого способа её забрать.
+    Если результат на Drive — он остаётся на диске независимо от того, что
+    случилось с фронтендом Gradio, и его можно найти и забрать вручную
+    даже если сама вкладка браузера так и не восстановила соединение."""
+    path = os.path.join(OUTPUT_DIR, f"{prefix}_{uuid.uuid4().hex}")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +87,7 @@ def fbi_build_corpus(selected_title, case_map, max_parts, progress=gr.Progress()
     from scraping.fbi_vault_scraper import build_case_corpus
 
     case_url = case_map[selected_title]
-    out_dir = tempfile.mkdtemp(prefix="fbi_case_")
+    out_dir = _persistent_workdir("fbi_case")
     max_parts_val = int(max_parts) if max_parts else None
 
     def on_progress(percent, message):
@@ -99,7 +114,7 @@ def fbi_extract_from_pdfs(pdf_files, progress=gr.Progress()):
     from scraping.fbi_vault_scraper import extract_corpus_from_pdfs
 
     pdf_paths = [f.name for f in pdf_files]
-    out_txt = os.path.join(tempfile.mkdtemp(prefix="fbi_pdfs_"), "combined_source.txt")
+    out_txt = os.path.join(_persistent_workdir("fbi_pdfs"), "combined_source.txt")
 
     def on_progress(percent, message):
         progress(min(percent / 100, 0.98), desc=message)
@@ -238,7 +253,7 @@ def run_shots_stage(script_file, srt_file, audio_file, progress=gr.Progress()):
             ".srt реально соответствует тексту сценария (те же реплики)."
         )
 
-    out_dir = tempfile.mkdtemp(prefix="shots_")
+    out_dir = _persistent_workdir("shots")
     shots_path = os.path.join(out_dir, "shots_timed.json")
     audio_path_value = audio_file.name if audio_file is not None else None
     with open(shots_path, "w", encoding="utf-8") as f:
@@ -284,7 +299,7 @@ def run_matching_stage(shots_file, aspect_ratio, progress=gr.Progress()):
         data = json.load(f)
     scenes = data["scenes"]
 
-    out_dir = tempfile.mkdtemp(prefix="matching_")
+    out_dir = _persistent_workdir("matching")
     out_path = os.path.join(out_dir, "footage.json")
 
     progress(0.0, desc="Загружаю CLIP и подключаюсь к DeepSeek...")
@@ -338,7 +353,7 @@ def run_assembly_stage(footage_file, audio_file, subtitles_file, style_slug,
         data = json.load(f)
     scenes = data["scenes"]
 
-    work_dir = tempfile.mkdtemp(prefix="video_assembly_")
+    work_dir = _persistent_workdir("video_assembly")
     clip_paths, durations = [], []
 
     for i, scene in enumerate(scenes):
