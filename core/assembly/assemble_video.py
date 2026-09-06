@@ -14,6 +14,46 @@ CROSSFADE_SEC = 0.5
 MIN_CLIP_SIZE = 10 * 1024  # 10 КБ
 DOWNLOAD_RETRIES = 2
 
+_NVENC_AVAILABLE: Optional[bool] = None
+
+
+def _has_nvenc() -> bool:
+    """Проверяет один раз (кэшируется), собран ли доступный ffmpeg с
+    поддержкой h264_nvenc — аппаратного энкодера NVIDIA. На Colab (T4) он
+    почти всегда есть, на локальной машине без дискретной видеокарты —
+    почти всегда нет, тогда просто используем libx264 как раньше.
+
+    Отключить принудительно (если nvenc почему-то ведёт себя нестабильно
+    в конкретном окружении): переменная окружения VIDEO_STUDIO_FORCE_LIBX264=1."""
+    global _NVENC_AVAILABLE
+    if os.environ.get("VIDEO_STUDIO_FORCE_LIBX264"):
+        return False
+    if _NVENC_AVAILABLE is None:
+        try:
+            result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                     capture_output=True, text=True, timeout=10)
+            _NVENC_AVAILABLE = "h264_nvenc" in result.stdout
+        except Exception:
+            _NVENC_AVAILABLE = False
+    return _NVENC_AVAILABLE
+
+
+def _video_encode_args() -> List[str]:
+    """Аргументы кодека для ffmpeg — до этого коммита ВСЕГДА возвращали
+    libx264 (программный энкодер), даже на Colab с доступным T4. Это была
+    задокументированная, но нереализованная задача с самого первого анализа
+    проекта (COLAB_MIGRATION_PLAN.md, TASK G-04) — три предыдущих сессии
+    правок её не коснулись, отсюда жалоба "чистый ffmpeg должен летать, а
+    еле ползёт": на каждый шот (normalize_clip), плюс склейка crossfade,
+    плюс прожиг субтитров — GPU физически не участвовала ни в одном.
+
+    -preset/-crf у libx264 и -preset/-cq у nvenc — РАЗНЫЕ шкалы, нельзя
+    просто перенести числа 1:1 (см. предупреждение в самом
+    COLAB_MIGRATION_PLAN.md на этот счёт) — подобраны отдельно."""
+    if _has_nvenc():
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20", "-b:v", "0"]
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]
+
 # Соотношение сторон готового видео. 16:9 — старое поведение (по умолчанию).
 # 9:16 — вертикальное, для TikTok/Reels/Shorts. Разрешение внутри каждой
 # ориентации фиксировано — этого достаточно для стокового b-roll, гнаться
@@ -101,6 +141,38 @@ def download_clip(url: str, dest: str):
     raise ValueError("Не удалось скачать видео")
 
 
+def generate_placeholder_clip(dest: str, duration: float,
+                               target_width: int = TARGET_WIDTH, target_height: int = TARGET_HEIGHT,
+                               color: str = "gray20"):
+    """Клип-заглушка для шота без подобранного видео — тёмно-серый фон
+    точно нужной длительности вместо того, чтобы молча пропустить шот.
+
+    Раньше run_assembly_stage() при отсутствии footage делал `continue`,
+    пропуская шот целиком — видео-дорожка получалась короче полной
+    озвучки НЕ только в конце, а с этого самого места, и весь материал
+    ПОСЛЕ пропущенного шота сдвигался относительно narration, оставаясь
+    рассинхронизированным до самого конца. mux_audio() с -shortest потом
+    просто тихо обрезает лишний хвост звука на итоговой (укороченной из-за
+    пропусков) длительности видео — то, что выглядело как "обрыв на
+    полуслове в конце", на самом деле означает рассинхрон, начавшийся
+    гораздо раньше, просто заметный по факту только на границе.
+
+    Плейсхолдер сохраняет тайминги видео=аудио всегда, и виден на глаз —
+    сразу понятно, где не хватило покрытия по видео, а не только слышно
+    заметно на слух, что что-то не так к концу ролика."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-f", "lavfi", "-i", f"color=c={color}:s={target_width}x{target_height}:r={TARGET_FPS}:d={duration}",
+    ] + _video_encode_args() + [
+        dest,
+    ]
+    try:
+        run(cmd)
+    except Exception:
+        _cleanup(dest)
+        raise
+
+
 def normalize_clip(src: str, dest: str, duration: float, offset: float = 0.0, source_duration: float = 0.0,
                     target_width: int = TARGET_WIDTH, target_height: int = TARGET_HEIGHT):
     """Приводит клип к единому разрешению/fps/без звука и точно нужной длительности
@@ -130,7 +202,8 @@ def normalize_clip(src: str, dest: str, duration: float, offset: float = 0.0, so
         "-t", str(duration),
         "-vf", f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
                f"crop={target_width}:{target_height},fps={TARGET_FPS}",
-        "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-an",
+    ] + _video_encode_args() + [
         dest,
     ]
     try:
@@ -176,7 +249,7 @@ def build_crossfade_chain(clip_paths: List[str], durations: List[float], out_pat
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", f"[{last_label}]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+    ] + _video_encode_args() + [
         out_path,
     ]
     try:
@@ -244,7 +317,7 @@ def burn_subtitles(video_path: str, srt_path: str, out_path: str, style_slug: Op
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-i", video_path,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+    ] + _video_encode_args() + [
         "-c:a", "copy",
         out_path,
     ]

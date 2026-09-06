@@ -423,11 +423,10 @@ class AssembleWorker(QThread):
 
             work_dir = tempfile.mkdtemp(prefix="video_assembly_")
             clip_paths, durations = [], []
+            placeholder_count, placeholder_seconds = 0, 0.0
 
             for i, scene in enumerate(scenes):
                 footage = scene.get("footage")
-                if not footage:
-                    continue
                 duration = round(scene["end"] - scene["start"], 2)
                 if duration <= 0:
                     continue
@@ -437,19 +436,37 @@ class AssembleWorker(QThread):
                 norm_path = os.path.join(work_dir, f"norm_{i}.mp4")
                 padded = round(duration + assemble_video.CROSSFADE_SEC, 2)
 
-                assemble_video.download_clip(footage["video_link"], raw_path)
-                assemble_video.normalize_clip(
-                    raw_path, norm_path, padded,
-                    offset=footage.get("best_offset", 0.0),
-                    source_duration=footage.get("duration", 0.0),
-                    target_width=target_width, target_height=target_height,
-                )
+                if footage:
+                    assemble_video.download_clip(footage["video_link"], raw_path)
+                    assemble_video.normalize_clip(
+                        raw_path, norm_path, padded,
+                        offset=footage.get("best_offset", 0.0),
+                        source_duration=footage.get("duration", 0.0),
+                        target_width=target_width, target_height=target_height,
+                    )
+                else:
+                    # Раньше здесь было continue — молча пропускало шот, отчего
+                    # видео отставало от полной озвучки НАЧИНАЯ с этого места
+                    # (не только в конце), а mux_audio() с -shortest потом тихо
+                    # обрезал звук по итоговой укороченной длительности видео.
+                    # См. assemble_video.generate_placeholder_clip.
+                    self.log_line.emit(f"    нет footage для {scene['id']} — вставляю плейсхолдер {padded}с")
+                    assemble_video.generate_placeholder_clip(norm_path, padded,
+                                                              target_width=target_width, target_height=target_height)
+                    placeholder_count += 1
+                    placeholder_seconds += duration
                 clip_paths.append(norm_path)
                 durations.append(padded)
 
             if not clip_paths:
                 self.finished_ok.emit(False, "Нет ни одного клипа для сборки")
                 return
+
+            if placeholder_count:
+                self.log_line.emit(
+                    f"ВНИМАНИЕ: {placeholder_count} шот(ов) без видео заменены заглушкой "
+                    f"({placeholder_seconds:.1f} сек суммарно) — проверьте footage.json"
+                )
 
             self.log_line.emit("Склеиваю клипы с кроссфейдом...")
             concat_path = os.path.join(work_dir, "concat.mp4")

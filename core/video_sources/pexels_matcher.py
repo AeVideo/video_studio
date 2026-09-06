@@ -640,10 +640,22 @@ def match_scene(scene: Dict, deepseek_client: OpenAI, clip_scorer: ClipScorer, p
                  used_ids: set, pixabay_key: Optional[str] = None,
                  thumbnails_dir: Optional[str] = None, orientation: str = "landscape",
                  archive_pool: Optional[List[Dict]] = None, archive_dead_ids: Optional[set] = None) -> Dict:
-    queries = generate_queries(scene["text"], deepseek_client)
+    # Замер по шагам — печатается через print() (см. web/gradio_app.py::_progress_stdout,
+    # который перехватывает это в реальном времени в прогресс-баре). Добавлено
+    # для диагностики реального узкого места вместо догадок по структуре кода:
+    # DeepSeek-вызовы (LLM, обычно 2-10 сек каждый), поиск на Pexels/Pixabay
+    # (сетевой round-trip на каждый запрос) и скоринг картинок (см. score_candidate,
+    # уже распараллелен) — три разных источника задержки, и на разном контенте
+    # доминировать может любой из них.
+    _t0 = time.time()
 
+    queries = generate_queries(scene["text"], deepseek_client)
+    print(f"    [timing] generate_queries: {time.time() - _t0:.1f}s")
+
+    _t = time.time()
     candidates_by_id: Dict[str, Dict] = {}
     _search_all(queries, pexels_key, pixabay_key, candidates_by_id, orientation=orientation)
+    print(f"    [timing] _search_all (первый проход, {len(queries)} запросов): {time.time() - _t:.1f}s")
 
     tried_queries = list(queries)
 
@@ -658,7 +670,9 @@ def match_scene(scene: Dict, deepseek_client: OpenAI, clip_scorer: ClipScorer, p
             was_reused = True
         return b, was_reused
 
+    _t = time.time()
     best, reused = _best_from_pool()
+    print(f"    [timing] score_pool (первый проход, {len(candidates_by_id)} кандидатов): {time.time() - _t:.1f}s")
 
     # Точность важнее скорости: если лучший результат первого прохода не
     # дотягивает до порога — просим DeepSeek альтернативные буквальные
@@ -666,17 +680,26 @@ def match_scene(scene: Dict, deepseek_client: OpenAI, clip_scorer: ClipScorer, p
     if RETRY_ON_LOW_CONFIDENCE and (best is None or best["score"] < SCORE_THRESHOLD):
         print(f"    score {best['score'] if best else '—'} ниже порога {SCORE_THRESHOLD} — "
               f"пробую альтернативные запросы...")
+        _t = time.time()
         retry_queries = generate_retry_queries(scene["text"], tried_queries, deepseek_client)
+        print(f"    [timing] generate_retry_queries: {time.time() - _t:.1f}s")
         tried_queries += retry_queries
+        _t = time.time()
         _search_all(retry_queries, pexels_key, pixabay_key, candidates_by_id, orientation=orientation)
+        print(f"    [timing] _search_all (retry, {len(retry_queries)} запросов): {time.time() - _t:.1f}s")
+        _t = time.time()
         retry_best, retry_reused = _best_from_pool()
+        print(f"    [timing] score_pool (retry, {len(candidates_by_id)} кандидатов): {time.time() - _t:.1f}s")
         if retry_best is not None and (best is None or retry_best["score"] > best["score"]):
             best, reused = retry_best, retry_reused
 
+    _t = time.time()
     archive_footage = None
     if archive_pool:
         archive_footage = _try_archive_pool(archive_pool, tried_queries, used_ids, clip_scorer,
                                              thumbnails_dir, scene.get("id"), archive_dead_ids=archive_dead_ids)
+    print(f"    [timing] archive_pool ({len(archive_pool or [])} кандидатов): {time.time() - _t:.1f}s")
+    print(f"    [timing] ИТОГО на шот: {time.time() - _t0:.1f}s")
 
     # Archive.org предпочитаем, если он вообще что-то нашёл и не отстаёт
     # заметно от лучшего стокового кандидата — настоящая хроника ценнее

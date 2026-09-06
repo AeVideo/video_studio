@@ -91,6 +91,29 @@ def _progress_stdout(progress_fn, base_percent: float):
         yield
 
 
+def _resolve_path(uploaded_file, typed_path: str, label: str = "файл"):
+    """Путь на диске (Drive) — в приоритете, если заполнены оба поля.
+
+    gr.File открывает диалог выбора файла БРАУЗЕРА — тот видит файлы
+    вашего локального компьютера, а не файловую систему сервера (VM
+    Colab), даже если нужный файл уже лежит на смонтированном Drive той
+    же VM. Из-за этого раньше единственным способом передать файл между
+    вкладками было: скачать его из интерфейса на свой компьютер, затем
+    загрузить обратно через тот же браузерный диалог — лишний, ничем не
+    обоснованный круг, если файл и так уже на Drive. Текстовое поле "путь
+    на диске" рядом с каждой загрузкой даёт способ обойти это: путь можно
+    скопировать прямо из файлового менеджера Colab слева (правая кнопка ->
+    Copy path) и вставить сюда, без единого скачивания."""
+    if typed_path and typed_path.strip():
+        path = typed_path.strip()
+        if not os.path.exists(path):
+            raise gr.Error(f"{label}: файл не найден по указанному пути: {path}")
+        return path
+    if uploaded_file is not None:
+        return uploaded_file.name
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Вкладка 1a: FBI Vault -> текст дела
 # Соответствует desktop/video_pipeline_gui/workers.py::CaseScrapeWorker.run(),
@@ -169,18 +192,20 @@ def fbi_extract_from_pdfs(pdf_files, progress=gr.Progress()):
 # если оба — приоритет у book_text_preview, он редактируемый).
 # ---------------------------------------------------------------------------
 
-def run_script_stage(book_file, book_text_preview, duration_minutes, language,
+def run_script_stage(book_file, book_path, book_text_preview, duration_minutes, language,
                       project_id, content_mode, progress=gr.Progress()):
     if not project_id:
         raise gr.Error("Укажите имя проекта — по нему создастся папка в PROJECTS_ROOT")
 
+    resolved_book_path = _resolve_path(book_file, book_path, "Текстовый источник")
+
     if book_text_preview and book_text_preview.strip():
         book_text = book_text_preview
-    elif book_file is not None:
-        with open(book_file.name, "r", encoding="utf-8") as f:
+    elif resolved_book_path is not None:
+        with open(resolved_book_path, "r", encoding="utf-8") as f:
             book_text = f.read()
     else:
-        raise gr.Error("Загрузите файл .txt или соберите текст дела на вкладке FBI Vault")
+        raise gr.Error("Загрузите файл .txt (или укажите путь на диске) — либо соберите текст дела на вкладке FBI Vault")
 
     out_dir = os.path.join(PROJECTS_ROOT, project_id)
     os.makedirs(out_dir, exist_ok=True)
@@ -224,10 +249,11 @@ def run_script_stage(book_file, book_text_preview, duration_minutes, language,
 # (режим A, один процесс — см. COLAB_MIGRATION_PLAN.md, раздел 3.2).
 # ---------------------------------------------------------------------------
 
-def run_subtitles_stage(audio_file, reference_text_file, language, model,
-                         progress=gr.Progress()):
-    if audio_file is None:
-        raise gr.Error("Загрузите аудио/видео с озвучкой")
+def run_subtitles_stage(audio_file, audio_path, reference_text_file, reference_text_path,
+                         language, model, progress=gr.Progress()):
+    resolved_audio = _resolve_path(audio_file, audio_path, "Аудио/видео с озвучкой")
+    if resolved_audio is None:
+        raise gr.Error("Загрузите аудио/видео с озвучкой (или укажите путь на диске)")
 
     device = default_device()
     if not model or model.startswith("Авто"):
@@ -238,13 +264,14 @@ def run_subtitles_stage(audio_file, reference_text_file, language, model,
         progress(min(percent / 100, 0.94), desc=message)
 
     raw_srt_path = run_transcribe(
-        audio_path=audio_file.name, language=language, model=model,
+        audio_path=resolved_audio, language=language, model=model,
         device=device, on_progress=on_progress,
     )
 
-    if reference_text_file is not None:
+    resolved_reference = _resolve_path(reference_text_file, reference_text_path, "Эталонный текст")
+    if resolved_reference is not None:
         progress(0.95, desc="Сверяю с эталонным текстом...")
-        fixed_srt_path = run_proofread(raw_srt_path, reference_text_file.name)
+        fixed_srt_path = run_proofread(raw_srt_path, resolved_reference)
         return fixed_srt_path, f"Готово (устройство: {device}, модель: {model}). Вычитано по эталону."
 
     return raw_srt_path, f"Готово (устройство: {device}, модель: {model}). Без вычитки — эталонный текст не загружен."
@@ -256,15 +283,18 @@ def run_subtitles_stage(audio_file, reference_text_file, language, model,
 # Раньше в Gradio отсутствовала целиком — shots.json неоткуда было взять.
 # ---------------------------------------------------------------------------
 
-def run_shots_stage(script_file, srt_file, audio_file, progress=gr.Progress()):
-    if script_file is None or srt_file is None:
-        raise gr.Error("Загрузите script.json (этап «Сценарий») и .srt (этап «Субтитры»)")
+def run_shots_stage(script_file, script_path, srt_file, srt_path, audio_file, audio_path,
+                     progress=gr.Progress()):
+    resolved_script = _resolve_path(script_file, script_path, "script.json")
+    resolved_srt = _resolve_path(srt_file, srt_path, ".srt")
+    if resolved_script is None or resolved_srt is None:
+        raise gr.Error("Укажите script.json (этап «Сценарий») и .srt (этап «Субтитры») — файлом или путём на диске")
 
     progress(0.1, desc="Читаю сценарий и субтитры...")
-    with open(script_file.name, "r", encoding="utf-8") as f:
+    with open(resolved_script, "r", encoding="utf-8") as f:
         script_scenes = json.load(f)
 
-    cues = srt_to_scenes.parse_srt(srt_file.name)
+    cues = srt_to_scenes.parse_srt(resolved_srt)
     words = srt_to_scenes.cues_to_word_timings(cues)
 
     progress(0.4, desc="Привязываю сцены к реальным таймингам речи...")
@@ -286,11 +316,11 @@ def run_shots_stage(script_file, srt_file, audio_file, progress=gr.Progress()):
             ".srt реально соответствует тексту сценария (те же реплики)."
         )
 
+    resolved_audio = _resolve_path(audio_file, audio_path, "Аудио озвучки")
     out_dir = _persistent_workdir("shots")
     shots_path = os.path.join(out_dir, "shots_timed.json")
-    audio_path_value = audio_file.name if audio_file is not None else None
     with open(shots_path, "w", encoding="utf-8") as f:
-        json.dump({"audio_path": audio_path_value, "srt_path": srt_file.name, "scenes": all_shots},
+        json.dump({"audio_path": resolved_audio, "srt_path": resolved_srt, "scenes": all_shots},
                    f, ensure_ascii=False, indent=2)
 
     progress(1.0, desc="Готово")
@@ -317,9 +347,10 @@ def _save_partial_matching(out_path, data, results):
     os.replace(tmp_path, out_path)
 
 
-def run_matching_stage(shots_file, aspect_ratio, progress=gr.Progress()):
-    if shots_file is None:
-        raise gr.Error("Загрузите shots.json (результат этапа «Сцены → Шоты»)")
+def run_matching_stage(shots_file, shots_path, aspect_ratio, progress=gr.Progress()):
+    resolved_shots = _resolve_path(shots_file, shots_path, "shots.json")
+    if resolved_shots is None:
+        raise gr.Error("Укажите shots.json (результат этапа «Сцены → Шоты») — файлом или путём на диске")
 
     pexels_key = os.environ.get("PEXELS_API_KEY")
     pixabay_key = os.environ.get("PIXABAY_API_KEY")
@@ -328,7 +359,7 @@ def run_matching_stage(shots_file, aspect_ratio, progress=gr.Progress()):
 
     orientation = "portrait" if aspect_ratio == "9:16" else "landscape"
 
-    with open(shots_file.name, "r", encoding="utf-8") as f:
+    with open(resolved_shots, "r", encoding="utf-8") as f:
         data = json.load(f)
     scenes = data["scenes"]
 
@@ -377,26 +408,28 @@ def run_matching_stage(shots_file, aspect_ratio, progress=gr.Progress()):
 # Соответствует desktop/video_pipeline_gui/workers.py::AssembleWorker.run().
 # ---------------------------------------------------------------------------
 
-def run_assembly_stage(footage_file, audio_file, subtitles_file, style_slug,
+def run_assembly_stage(footage_file, footage_path, audio_file, audio_path,
+                        subtitles_file, subtitles_path, style_slug,
                         aspect_ratio, progress=gr.Progress()):
-    if footage_file is None:
-        raise gr.Error("Загрузите footage.json (результат этапа «Подбор видео»)")
-    if audio_file is None:
-        raise gr.Error("Загрузите файл озвучки")
+    resolved_footage = _resolve_path(footage_file, footage_path, "footage.json")
+    resolved_audio = _resolve_path(audio_file, audio_path, "Аудио озвучки")
+    if resolved_footage is None:
+        raise gr.Error("Укажите footage.json (результат этапа «Подбор видео») — файлом или путём на диске")
+    if resolved_audio is None:
+        raise gr.Error("Укажите файл озвучки — файлом или путём на диске")
 
     target_width, target_height = assemble_video.ASPECT_RATIOS[aspect_ratio]
 
-    with open(footage_file.name, "r", encoding="utf-8") as f:
+    with open(resolved_footage, "r", encoding="utf-8") as f:
         data = json.load(f)
     scenes = data["scenes"]
 
     work_dir = _persistent_workdir("video_assembly")
     clip_paths, durations = [], []
+    placeholder_count, placeholder_seconds = 0, 0.0
 
     for i, scene in enumerate(scenes):
         footage = scene.get("footage")
-        if not footage:
-            continue
         duration = round(scene["end"] - scene["start"], 2)
         if duration <= 0:
             continue
@@ -409,13 +442,25 @@ def run_assembly_stage(footage_file, audio_file, subtitles_file, style_slug,
 
         base_percent = 0.05 + 0.7 * (i + 1) / max(len(scenes), 1)
         with _progress_stdout(progress, base_percent):
-            assemble_video.download_clip(footage["video_link"], raw_path)
-            assemble_video.normalize_clip(
-                raw_path, norm_path, padded,
-                offset=footage.get("best_offset", 0.0),
-                source_duration=footage.get("duration", 0.0),
-                target_width=target_width, target_height=target_height,
-            )
+            if footage:
+                assemble_video.download_clip(footage["video_link"], raw_path)
+                assemble_video.normalize_clip(
+                    raw_path, norm_path, padded,
+                    offset=footage.get("best_offset", 0.0),
+                    source_duration=footage.get("duration", 0.0),
+                    target_width=target_width, target_height=target_height,
+                )
+            else:
+                # Раньше здесь было continue — молча пропускало шот, из-за
+                # чего видео-дорожка отставала от полной озвучки НАЧИНАЯ с
+                # этого места, а не только в конце (см. комментарий в
+                # assemble_video.generate_placeholder_clip). Плейсхолдер
+                # держит тайминги видео=аудио всегда.
+                print(f"    нет footage для {scene['id']} — вставляю плейсхолдер {padded}с")
+                assemble_video.generate_placeholder_clip(norm_path, padded,
+                                                          target_width=target_width, target_height=target_height)
+                placeholder_count += 1
+                placeholder_seconds += duration
         clip_paths.append(norm_path)
         durations.append(padded)
 
@@ -429,17 +474,23 @@ def run_assembly_stage(footage_file, audio_file, subtitles_file, style_slug,
     assemble_video.build_crossfade_chain(clip_paths, durations, concat_path)
 
     progress(0.88, desc="Накладываю озвучку...")
-    if subtitles_file is not None:
+    resolved_subtitles = _resolve_path(subtitles_file, subtitles_path, "Субтитры")
+    if resolved_subtitles is not None:
         muxed_path = os.path.join(work_dir, "muxed.mp4")
-        assemble_video.mux_audio(concat_path, audio_file.name, muxed_path)
+        assemble_video.mux_audio(concat_path, resolved_audio, muxed_path)
         progress(0.94, desc="Прожигаю субтитры...")
         slug = style_slug if style_slug and style_slug != "(без стиля по умолчанию)" else None
-        assemble_video.burn_subtitles(muxed_path, subtitles_file.name, out_path, style_slug=slug)
+        assemble_video.burn_subtitles(muxed_path, resolved_subtitles, out_path, style_slug=slug)
     else:
-        assemble_video.mux_audio(concat_path, audio_file.name, out_path)
+        assemble_video.mux_audio(concat_path, resolved_audio, out_path)
 
     progress(1.0, desc="Готово")
-    return out_path, f"Собрано: {out_path} ({len(clip_paths)} клипов)"
+    status = f"Собрано: {out_path} ({len(clip_paths)} клипов)"
+    if placeholder_count:
+        status += (f" — ВНИМАНИЕ: {placeholder_count} шот(ов) без подобранного видео "
+                   f"заменены серой заглушкой ({placeholder_seconds:.1f} сек суммарно). "
+                   f"Проверьте footage.json на статусы no_candidates/scoring_failed.")
+    return out_path, status
 
 
 # ---------------------------------------------------------------------------
@@ -448,10 +499,15 @@ def run_assembly_stage(footage_file, audio_file, subtitles_file, style_slug,
 
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="video_studio") as demo:
+        _storage_note = ("✅ Google Drive — переживёт пересоздание рантайма Colab"
+                          if IN_COLAB else "локальная машина")
         gr.Markdown(
             "# video_studio\n"
             "Web-интерфейс поверх той же логики, что и десктопные GUI. "
-            "Все четыре стадии рабочие: Сценарий → Субтитры → Подбор видео → Сборка."
+            "Все пять стадий рабочие: Сценарий → Субтитры → Сцены→Шоты → Подбор видео → Сборка.\n\n"
+            f"**Файлы сохраняются в: `{VIDEO_STUDIO_HOME}`** ({_storage_note}). "
+            "Проверьте этот путь перед долгой задачей — если на Colab он не начинается с "
+            "`/content/drive/`, результат пропадёт при пересоздании рантайма."
         )
 
         with gr.Tab("1. Источник → Сценарий"):
@@ -462,6 +518,8 @@ def build_app() -> gr.Blocks:
 
             with gr.Group(visible=True) as file_group:
                 book_file = gr.File(label="Текстовый источник (.txt)")
+                book_path = gr.Textbox(label="...или путь на диске (Drive)",
+                                        placeholder="/content/drive/MyDrive/video_studio_home/...")
 
             with gr.Group(visible=False) as fbi_group:
                 gr.Markdown(
@@ -527,7 +585,7 @@ def build_app() -> gr.Blocks:
             script_out = gr.Textbox(label="Результат", lines=10)
             script_btn.click(
                 run_script_stage,
-                inputs=[book_file, book_text_preview, duration_minutes, language, project_id, content_mode],
+                inputs=[book_file, book_path, book_text_preview, duration_minutes, language, project_id, content_mode],
                 outputs=script_out,
             )
 
@@ -536,7 +594,11 @@ def build_app() -> gr.Blocks:
                         f"модель по умолчанию: **{default_model()}** "
                         "(base на CPU — тайминги, точный текст всё равно из вычитки; large-v3 на GPU)")
             audio_file = gr.File(label="Аудио/видео с озвучкой")
+            subs_audio_path = gr.Textbox(label="...или путь на диске (Drive)",
+                                          placeholder="/content/drive/MyDrive/video_studio_home/...")
             reference_text_file = gr.File(label="Эталонный текст (narration_text.txt) — опционально, для вычитки")
+            reference_text_path = gr.Textbox(label="...или путь на диске (Drive)",
+                                              placeholder="/content/drive/MyDrive/video_studio_home/...")
             with gr.Row():
                 sub_language = gr.Dropdown(["ru", "en", "Auto"], value="ru", label="Язык")
                 sub_model = gr.Dropdown(
@@ -548,7 +610,7 @@ def build_app() -> gr.Blocks:
             subs_status_out = gr.Textbox(label="Статус")
             subs_btn.click(
                 run_subtitles_stage,
-                inputs=[audio_file, reference_text_file, sub_language, sub_model],
+                inputs=[audio_file, subs_audio_path, reference_text_file, reference_text_path, sub_language, sub_model],
                 outputs=[subs_file_out, subs_status_out],
             )
 
@@ -558,13 +620,21 @@ def build_app() -> gr.Blocks:
                 "каждую сцену в отдельные шоты. Результат (`shots.json`) идёт на вход вкладке «Подбор видео»."
             )
             shots_script_file = gr.File(label="script.json (этап «Сценарий»)")
+            shots_script_path = gr.Textbox(label="...или путь на диске (Drive)",
+                                            placeholder="/content/drive/MyDrive/video_studio_home/...")
             shots_srt_file = gr.File(label=".srt (этап «Субтитры»)")
+            shots_srt_path = gr.Textbox(label="...или путь на диске (Drive)",
+                                         placeholder="/content/drive/MyDrive/video_studio_home/...")
             shots_audio_file = gr.File(label="Аудио озвучки — опционально, просто сохраняется как метаданные")
+            shots_audio_path = gr.Textbox(label="...или путь на диске (Drive)",
+                                           placeholder="/content/drive/MyDrive/video_studio_home/...")
             shots_btn = gr.Button("Развернуть в шоты", variant="primary")
             shots_file_out = gr.File(label="shots.json")
             shots_status_out = gr.Textbox(label="Статус")
             shots_btn.click(
-                run_shots_stage, inputs=[shots_script_file, shots_srt_file, shots_audio_file],
+                run_shots_stage,
+                inputs=[shots_script_file, shots_script_path, shots_srt_file, shots_srt_path,
+                        shots_audio_file, shots_audio_path],
                 outputs=[shots_file_out, shots_status_out],
             )
 
@@ -576,20 +646,28 @@ def build_app() -> gr.Blocks:
                 "готовый `footage.json` не проблема."
             )
             shots_file = gr.File(label="shots.json (результат этапа «Сцены → Шоты»)")
+            shots_path_input = gr.Textbox(label="...или путь на диске (Drive)",
+                                           placeholder="/content/drive/MyDrive/video_studio_home/...")
             match_aspect = gr.Dropdown(["16:9", "9:16"], value="16:9", label="Соотношение сторон")
             match_btn = gr.Button("Подобрать видео", variant="primary")
             match_file_out = gr.File(label="footage.json")
             match_status_out = gr.Textbox(label="Статус")
             match_btn.click(
-                run_matching_stage, inputs=[shots_file, match_aspect],
+                run_matching_stage, inputs=[shots_file, shots_path_input, match_aspect],
                 outputs=[match_file_out, match_status_out],
             )
 
         with gr.Tab("5. Сборка"):
             gr.Markdown("Финальная склейка: кроссфейд между клипами, наложение озвучки, прожиг субтитров.")
             footage_file = gr.File(label="footage.json (результат этапа «Подбор видео»)")
+            footage_path = gr.Textbox(label="...или путь на диске (Drive)",
+                                       placeholder="/content/drive/MyDrive/video_studio_home/...")
             assembly_audio_file = gr.File(label="Аудио озвучки")
+            assembly_audio_path = gr.Textbox(label="...или путь на диске (Drive)",
+                                              placeholder="/content/drive/MyDrive/video_studio_home/...")
             assembly_subs_file = gr.File(label="Субтитры (.srt/.ass) — опционально, без них прожига не будет")
+            assembly_subs_path = gr.Textbox(label="...или путь на диске (Drive)",
+                                             placeholder="/content/drive/MyDrive/video_studio_home/...")
 
             try:
                 style_choices = ["(без стиля по умолчанию)"] + [
@@ -606,13 +684,16 @@ def build_app() -> gr.Blocks:
             assembly_file_out = gr.File(label="Готовое видео")
             assembly_status_out = gr.Textbox(label="Статус")
 
-            def _run_assembly_wrapper(footage_file, audio_file, subs_file, style_choice, aspect, progress=gr.Progress()):
+            def _run_assembly_wrapper(footage_file, footage_path, audio_file, audio_path,
+                                       subs_file, subs_path, style_choice, aspect, progress=gr.Progress()):
                 slug = style_choice.split("::", 1)[0] if style_choice and "::" in style_choice else None
-                return run_assembly_stage(footage_file, audio_file, subs_file, slug, aspect, progress=progress)
+                return run_assembly_stage(footage_file, footage_path, audio_file, audio_path,
+                                           subs_file, subs_path, slug, aspect, progress=progress)
 
             assembly_btn.click(
                 _run_assembly_wrapper,
-                inputs=[footage_file, assembly_audio_file, assembly_subs_file, assembly_style, assembly_aspect],
+                inputs=[footage_file, footage_path, assembly_audio_file, assembly_audio_path,
+                        assembly_subs_file, assembly_subs_path, assembly_style, assembly_aspect],
                 outputs=[assembly_file_out, assembly_status_out],
             )
 

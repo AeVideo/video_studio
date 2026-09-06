@@ -31,6 +31,33 @@ VIDEO_STUDIO_HOME = os.environ.get(
     os.path.join(os.path.expanduser("~"), "video_studio_home"),
 )
 
+# На Colab "~" (например /root) — это диск самой VM: эфемерный, стирается
+# при пересоздании рантайма вместе со всем, что туда записано. Реальный
+# случай: пользователь потратил несколько часов на транскрипцию, а к
+# моменту скачивания результата файла уже не было — VIDEO_STUDIO_HOME
+# молча откатилась на локальный путь VM вместо Drive, потому что
+# соответствующая переменная окружения не была установлена ДО того, как
+# был запущен процесс (например, после Restart runtime ячейку с
+# os.environ["VIDEO_STUDIO_HOME"] = ... забыли прогнать заново перед
+# повторным запуском web/gradio_app.py). Раньше это происходило абсолютно
+# тихо. Останавливаем сразу и явно, а не позволяем часам работы потеряться
+# молча ещё раз.
+_IN_COLAB = os.path.exists("/content")
+if _IN_COLAB and not VIDEO_STUDIO_HOME.startswith("/content/drive/"):
+    raise RuntimeError(
+        f"VIDEO_STUDIO_HOME=\"{VIDEO_STUDIO_HOME}\" не похож на путь на Google Drive, "
+        f"хотя это Colab (обнаружен /content). Всё, что будет сюда записано "
+        f"(субтитры, видео, промежуточные файлы), пропадёт при пересоздании "
+        f"рантайма/остановке сессии — то есть именно та потеря результата, из-за "
+        f"которой это исключение и добавлено. Установите переменную окружения "
+        f"VIDEO_STUDIO_HOME на путь внутри /content/drive/... ДО запуска "
+        f"web/gradio_app.py (см. notebooks/colab_setup.ipynb, ячейка 2) и "
+        f"перезапустите процесс заново."
+    )
+
+print(f"[config.paths] VIDEO_STUDIO_HOME = {VIDEO_STUDIO_HOME}"
+      f"{' (Google Drive — переживёт пересоздание рантайма)' if _IN_COLAB else ''}")
+
 PROJECTS_ROOT = os.path.join(VIDEO_STUDIO_HOME, "projects")
 OUTPUT_DIR = os.path.join(VIDEO_STUDIO_HOME, "output")
 LOGS_DIR = os.path.join(VIDEO_STUDIO_HOME, "logs")
