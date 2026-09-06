@@ -377,29 +377,49 @@ class ClipScorer:
     _cached_model = None
     _cached_preprocess = None
     _cached_tokenizer = None
+    _cached_device = None
 
-    def __init__(self, model_name: str = CLIP_MODEL_NAME, pretrained: str = CLIP_PRETRAINED):
+    def __init__(self, model_name: str = CLIP_MODEL_NAME, pretrained: str = CLIP_PRETRAINED,
+                 device: Optional[str] = None):
         # Конструктор НЕ загружает модель — происходит ленивая загрузка
         # при первом реальном вызове embed_text/embed_image_url.
+        #
+        # device=None -> автоопределение (cuda, если доступна, иначе cpu).
+        # Раньше здесь не было НИ ОДНОГО .to(device) во всём классе — модель
+        # и все тензоры молча оставались на том устройстве, куда torch кладёт
+        # их по умолчанию (CPU). На Colab с T4 это означало, что GPU просто
+        # простаивала, а CLIP считался на общем shared vCPU Colab — который
+        # на практике может быть медленнее домашнего процессора пользователя.
+        # См. COLAB_MIGRATION_PLAN.md, раздел 2.2 (TASK G-01) — было
+        # задокументировано изначально, но реализация потерялась в потоке
+        # последующих правок и не попала в код до этого момента.
         self.model_name = model_name
         self.pretrained = pretrained
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
         self.preprocess = None
         self.tokenizer = None
 
     def _ensure_loaded(self):
-        """Загружает CLIP один раз и сохраняет в классовый кэш."""
-        if ClipScorer._cached_model is None:
-            print(f"Загружаю CLIP ({self.model_name}, {self.pretrained}) "
+        """Загружает CLIP один раз и сохраняет в классовый кэш.
+
+        Кэш инвалидируется, если запросили другое устройство, чем то, на
+        котором уже загружена закэшированная модель — иначе первый созданный
+        на CPU инстанс намертво зафиксировал бы устройство для всех
+        последующих ClipScorer() в этом процессе, даже если GPU доступна."""
+        if ClipScorer._cached_model is None or ClipScorer._cached_device != self.device:
+            print(f"Загружаю CLIP ({self.model_name}, {self.pretrained}) на {self.device} "
                   f"— при первом запуске скачает веса, дальше из кэша...")
             model, _, preprocess = open_clip.create_model_and_transforms(
                 self.model_name, pretrained=self.pretrained
             )
             tokenizer = open_clip.get_tokenizer(self.model_name)
             model.eval()
+            model = model.to(self.device)
             ClipScorer._cached_model = model
             ClipScorer._cached_preprocess = preprocess
             ClipScorer._cached_tokenizer = tokenizer
+            ClipScorer._cached_device = self.device
 
         self.model = ClipScorer._cached_model
         self.preprocess = ClipScorer._cached_preprocess
@@ -408,7 +428,7 @@ class ClipScorer:
     def embed_text(self, text: str) -> torch.Tensor:
         self._ensure_loaded()
         with torch.no_grad():
-            tokens = self.tokenizer([text])
+            tokens = self.tokenizer([text]).to(self.device)
             features = self.model.encode_text(tokens)
             return features / features.norm(dim=-1, keepdim=True)
 
@@ -423,7 +443,7 @@ class ClipScorer:
             return None
 
         with torch.no_grad():
-            tensor = self.preprocess(image).unsqueeze(0)
+            tensor = self.preprocess(image).unsqueeze(0).to(self.device)
             features = self.model.encode_image(tensor)
             return features / features.norm(dim=-1, keepdim=True)
 
