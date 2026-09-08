@@ -15,26 +15,42 @@ MIN_CLIP_SIZE = 10 * 1024  # 10 КБ
 DOWNLOAD_RETRIES = 2
 
 _NVENC_AVAILABLE: Optional[bool] = None
+LIBX264_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]
+NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20", "-b:v", "0"]
 
 
 def _has_nvenc() -> bool:
-    """Проверяет один раз (кэшируется), собран ли доступный ffmpeg с
-    поддержкой h264_nvenc — аппаратного энкодера NVIDIA. На Colab (T4) он
-    почти всегда есть, на локальной машине без дискретной видеокарты —
-    почти всегда нет, тогда просто используем libx264 как раньше.
+    """Проверяет один раз (кэшируется) РЕАЛЬНЫМ тестовым кодированием, а не
+    просто наличием h264_nvenc в списке `ffmpeg -encoders` — тот список
+    показывает, что энкодер СКОМПИЛИРОВАН, а не что он реально работает в
+    этом конкретном окружении прямо сейчас (драйвер/лимиты/конкретный
+    рантайм могут отличаться). На практике наблюдался краш сборки видео
+    "на определённом моменте" после нескольких успешно обработанных
+    клипов — расследование ffmpeg-логов было недоступно, но именно так
+    выглядела бы ситуация "encoders list врёт" или "nvenc падает не на
+    любом входе, а на части". Реальный тестовый прогон ловит первый
+    случай сразу при старте; add_video_encode_args_with_fallback() ниже
+    защищает и от второго — падение конкретной команды с nvenc больше не
+    рушит всю сборку, а откатывается на libx264 для этой же команды.
 
-    Отключить принудительно (если nvenc почему-то ведёт себя нестабильно
-    в конкретном окружении): переменная окружения VIDEO_STUDIO_FORCE_LIBX264=1."""
+    Отключить принудительно: переменная окружения VIDEO_STUDIO_FORCE_LIBX264=1."""
     global _NVENC_AVAILABLE
     if os.environ.get("VIDEO_STUDIO_FORCE_LIBX264"):
         return False
     if _NVENC_AVAILABLE is None:
+        test_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
+        ] + NVENC_ARGS + ["-f", "null", "-"]
         try:
-            result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
-                                     capture_output=True, text=True, timeout=10)
-            _NVENC_AVAILABLE = "h264_nvenc" in result.stdout
-        except Exception:
+            result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=15)
+            _NVENC_AVAILABLE = result.returncode == 0
+            if not _NVENC_AVAILABLE:
+                print(f"[assemble_video] h264_nvenc не прошёл тестовое кодирование в этом "
+                      f"окружении — использую libx264. ffmpeg: {result.stderr.strip()[-300:]}")
+        except Exception as e:
             _NVENC_AVAILABLE = False
+            print(f"[assemble_video] Проверка h264_nvenc упала ({e}) — использую libx264.")
     return _NVENC_AVAILABLE
 
 
@@ -50,9 +66,28 @@ def _video_encode_args() -> List[str]:
     -preset/-crf у libx264 и -preset/-cq у nvenc — РАЗНЫЕ шкалы, нельзя
     просто перенести числа 1:1 (см. предупреждение в самом
     COLAB_MIGRATION_PLAN.md на этот счёт) — подобраны отдельно."""
-    if _has_nvenc():
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20", "-b:v", "0"]
-    return ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]
+    return NVENC_ARGS if _has_nvenc() else LIBX264_ARGS
+
+
+def _run_encode(cmd_prefix: List[str], cmd_suffix: List[str]):
+    """Собирает и запускает ffmpeg-команду кодирования видео с автоматическим
+    откатом на libx264, если конкретная команда с nvenc падает — даже когда
+    _has_nvenc() при старте сказала, что энкодер в целом работает (тестовое
+    кодирование 64x64 может пройти, а падение случиться на конкретном
+    реальном клипе — другое разрешение/формат/что угодно специфичное для
+    именно этого входа). Раньше падение здесь рушило всю сборку целиком."""
+    codec_args = _video_encode_args()
+    cmd = cmd_prefix + codec_args + cmd_suffix
+    try:
+        run(cmd)
+    except Exception as e:
+        if codec_args is NVENC_ARGS:
+            print(f"[assemble_video] h264_nvenc упал на этой команде ({e}) — "
+                  f"повторяю тот же клип с libx264...")
+            run(cmd_prefix + LIBX264_ARGS + cmd_suffix)
+        else:
+            raise
+
 
 # Соотношение сторон готового видео. 16:9 — старое поведение (по умолчанию).
 # 9:16 — вертикальное, для TikTok/Reels/Shorts. Разрешение внутри каждой
@@ -160,14 +195,12 @@ def generate_placeholder_clip(dest: str, duration: float,
     Плейсхолдер сохраняет тайминги видео=аудио всегда, и виден на глаз —
     сразу понятно, где не хватило покрытия по видео, а не только слышно
     заметно на слух, что что-то не так к концу ролика."""
-    cmd = [
+    cmd_prefix = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-f", "lavfi", "-i", f"color=c={color}:s={target_width}x{target_height}:r={TARGET_FPS}:d={duration}",
-    ] + _video_encode_args() + [
-        dest,
     ]
     try:
-        run(cmd)
+        _run_encode(cmd_prefix, [dest])
     except Exception:
         _cleanup(dest)
         raise
@@ -194,20 +227,18 @@ def normalize_clip(src: str, dest: str, duration: float, offset: float = 0.0, so
     if offset and source_duration and (source_duration - offset) >= duration:
         effective_offset = offset
 
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+    cmd_prefix = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
     if effective_offset:
-        cmd += ["-ss", str(effective_offset)]
-    cmd += [
+        cmd_prefix += ["-ss", str(effective_offset)]
+    cmd_prefix += [
         "-stream_loop", "-1", "-i", src,
         "-t", str(duration),
         "-vf", f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
                f"crop={target_width}:{target_height},fps={TARGET_FPS}",
         "-an",
-    ] + _video_encode_args() + [
-        dest,
     ]
     try:
-        run(cmd)
+        _run_encode(cmd_prefix, [dest])
     except Exception:
         _cleanup(dest)
         raise
@@ -246,14 +277,12 @@ def build_crossfade_chain(clip_paths: List[str], durations: List[float], out_pat
         cumulative += durations[i] - CROSSFADE_SEC
 
     filter_complex = ";".join(filter_parts)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"] + inputs + [
+    cmd_prefix = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", f"[{last_label}]",
-    ] + _video_encode_args() + [
-        out_path,
     ]
     try:
-        run(cmd)
+        _run_encode(cmd_prefix, [out_path])
     except Exception:
         _cleanup(out_path)
         raise
@@ -313,16 +342,13 @@ def burn_subtitles(video_path: str, srt_path: str, out_path: str, style_slug: Op
         fonts_dir = _escape_ffmpeg_filter_path(os.path.abspath(oasis_studio_bridge.BUNDLED_FONTS_DIR))
         vf += f":fontsdir={fonts_dir}"
 
-    cmd = [
+    cmd_prefix = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-i", video_path,
         "-vf", vf,
-    ] + _video_encode_args() + [
-        "-c:a", "copy",
-        out_path,
     ]
     try:
-        run(cmd)
+        _run_encode(cmd_prefix, ["-c:a", "copy", out_path])
     except Exception:
         _cleanup(out_path)
         raise

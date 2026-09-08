@@ -23,6 +23,7 @@ API (публичные, без ключа):
 """
 
 import argparse
+import concurrent.futures
 import os
 import re
 import subprocess
@@ -153,7 +154,14 @@ def find_best_offset(video_url: str, duration: float, query: str, clip_scorer: "
     """Сэмплирует кадры по всей длине ролика, скорит их тем же CLIP, что и
     Pexels-кандидатов, возвращает лучший таймкод + score + путь к лучшему
     кадру (для превью в GUI). None, если ни один кадр не удалось вытащить
-    или длительность ролика неизвестна."""
+    или длительность ролика неизвестна.
+
+    Сэмплы обрабатываются ПАРАЛЛЕЛЬНО (ThreadPoolExecutor) — раньше это был
+    последовательный цикл по num_samples таймкодам, каждый — отдельный
+    ffmpeg-процесс с сетевым seek (до FRAME_EXTRACT_TIMEOUT=25с на попытку
+    в худшем случае). subprocess.run отпускает GIL на время ожидания
+    ffmpeg, поэтому параллелизм здесь реальный, как и в
+    core/video_sources/pexels_matcher.py::score_candidate."""
     if not duration or duration <= OFFSET_EDGE_MARGIN_SEC * 2:
         return None
 
@@ -169,49 +177,52 @@ def find_best_offset(video_url: str, duration: float, query: str, clip_scorer: "
         return None
 
     work_dir = tempfile.mkdtemp(prefix="archive_frames_")
-    best = None  # (score, timestamp, frame_path)
-    any_frame_extracted = False
-    try:
-        consecutive_failures = 0
-        EARLY_ABORT_AFTER = 2  # если первые 2 сэмпла подряд провалились (сеть/формат) —
-                                # почти наверняка провалятся и все остальные, не тратим ещё N×25с
-        for i, ts in enumerate(timestamps):
-            frame_path = os.path.join(work_dir, f"frame_{i}.jpg")
-            if not _extract_frame_at(video_url, ts, frame_path, verbose=not any_frame_extracted and i == 0):
-                consecutive_failures += 1
-                if not any_frame_extracted and consecutive_failures >= EARLY_ABORT_AFTER:
-                    print(f"    archive.org: {EARLY_ABORT_AFTER} подряд неудачных сэмпла — "
-                          f"похоже видео не отдаёт быстрый seek, обрываю рано")
-                    break
-                continue
-            consecutive_failures = 0
-            any_frame_extracted = True
-            try:
-                from PIL import Image
-                import torch
-                image = Image.open(frame_path).convert("RGB")
-                with torch.no_grad():
-                    tensor = clip_scorer.preprocess(image).unsqueeze(0)
-                    features = clip_scorer.model.encode_image(tensor)
-                    img_emb = features / features.norm(dim=-1, keepdim=True)
-                    sim = (img_emb @ text_embedding.T).item()
-            except Exception as e:
-                print(f"    не удалось оценить кадр на {ts}с: {e}")
-                continue
 
-            if best is None or sim > best[0]:
-                # копируем лучший кадр за пределы work_dir до его удаления
-                keep_path = frame_path + ".keep"
-                os.replace(frame_path, keep_path)
-                if best is not None:
-                    old_keep = best[2]
-                    if os.path.exists(old_keep):
-                        os.remove(old_keep)
-                best = (sim, ts, keep_path)
-
-        if best is None:
+    def _extract_and_score(i: int, ts: float):
+        frame_path = os.path.join(work_dir, f"frame_{i}.jpg")
+        if not _extract_frame_at(video_url, ts, frame_path, verbose=(i == 0)):
             return None
-        return {"offset": best[1], "score": round(best[0], 4), "frame_path": best[2]}
+        try:
+            from PIL import Image
+            import torch
+            image = Image.open(frame_path).convert("RGB")
+            with torch.no_grad():
+                # .to(clip_scorer.device) обязателен — без него тензор
+                # остаётся на CPU по умолчанию, а модель (после GPU-фикса
+                # ClipScorer.embed_text/embed_image_url) теперь на cuda на
+                # Colab. Несовпадение устройств кидает RuntimeError на
+                # КАЖДОМ кадре, который тихо проглатывался общим except
+                # ниже — Archive.org на GPU молча никогда не находил ни
+                # одного совпадения, что выглядело как "почти не
+                # используется", а на деле было полностью сломано этим
+                # багом (независимая от pexels_matcher.py копия
+                # CLIP-инференса, обращается к clip_scorer.model напрямую,
+                # в обход embed_image_url — тот фикс её не касался).
+                tensor = clip_scorer.preprocess(image).unsqueeze(0).to(clip_scorer.device)
+                features = clip_scorer.model.encode_image(tensor)
+                img_emb = features / features.norm(dim=-1, keepdim=True)
+                sim = (img_emb @ text_embedding.T).item()
+        except Exception as e:
+            print(f"    не удалось оценить кадр на {ts}с: {e}")
+            return None
+        return (sim, ts, frame_path)
+
+    try:
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(_extract_and_score, i, ts) for i, ts in enumerate(timestamps)]
+            for future in concurrent.futures.as_completed(futures):
+                r = future.result()
+                if r is not None:
+                    results.append(r)
+
+        if not results:
+            return None
+        best = max(results, key=lambda r: r[0])
+        sim, ts, frame_path = best
+        keep_path = frame_path + ".keep"
+        os.replace(frame_path, keep_path)
+        return {"offset": ts, "score": round(sim, 4), "frame_path": keep_path}
     finally:
         # work_dir может ещё содержать .keep файл лучшего кадра — не трогаем его,
         # чистим только оставшиеся временные кадры

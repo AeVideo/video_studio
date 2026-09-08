@@ -27,10 +27,24 @@ Web-интерфейс поверх той же бизнес-логики, чт�
       адаптер поверх desktop/video_pipeline_gui/workers.py::AssembleWorker)
 """
 import contextlib
+import concurrent.futures
 import io
 import json
 import os
 import uuid
+
+# GRADIO_TEMP_DIR должен быть установлен ДО импорта gradio — библиотека
+# читает эту переменную один раз при инициализации. Без этого Gradio
+# копирует/кеширует отдаваемые файлы в СВОЙ СОБСТВЕННЫЙ системный temp
+# (обычно /tmp) независимо от того, что наш код пишет через
+# _persistent_workdir() ниже — отдельный, незаметный источник "файл был
+# на диске, а потом пропал" на Colab, не связанный с VIDEO_STUDIO_HOME
+# напрямую, но с тем же самым разрушительным эффектом при пересоздании
+# рантайма.
+_video_studio_home_early = os.environ.get(
+    "VIDEO_STUDIO_HOME", os.path.join(os.path.expanduser("~"), "video_studio_home")
+)
+os.environ.setdefault("GRADIO_TEMP_DIR", os.path.join(_video_studio_home_early, "gradio_tmp"))
 
 import gradio as gr
 
@@ -428,6 +442,35 @@ def run_assembly_stage(footage_file, footage_path, audio_file, audio_path,
     clip_paths, durations = [], []
     placeholder_count, placeholder_seconds = 0, 0.0
 
+    # Фаза 1: скачивание сырых клипов ПАРАЛЛЕЛЬНО — сетевой I/O, безопасно
+    # распараллелить (requests отпускает GIL на время ожидания ответа).
+    # Кодирование (фаза 2 ниже) сознательно оставлено последовательным —
+    # несколько одновременных ffmpeg с h264_nvenc рискуют упереться в лимит
+    # одновременных сессий аппаратного энкодера и либо тормозить друг
+    # друга, либо падать вместо ускорения.
+    download_tasks = []
+    for i, scene in enumerate(scenes):
+        footage = scene.get("footage")
+        duration = round(scene["end"] - scene["start"], 2)
+        if duration <= 0 or not footage:
+            continue
+        raw_path = os.path.join(work_dir, f"raw_{i}.mp4")
+        download_tasks.append((i, footage, raw_path))
+
+    progress(0.02, desc=f"Скачиваю {len(download_tasks)} клипов параллельно...")
+
+    def _download_one(task):
+        i, footage, raw_path = task
+        with _progress_stdout(progress, 0.02):
+            assemble_video.download_clip(footage["video_link"], raw_path)
+        return i
+
+    if download_tasks:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            for _ in executor.map(_download_one, download_tasks):
+                pass
+
+    # Фаза 2: нормализация/кодирование — последовательно.
     for i, scene in enumerate(scenes):
         footage = scene.get("footage")
         duration = round(scene["end"] - scene["start"], 2)
@@ -443,7 +486,6 @@ def run_assembly_stage(footage_file, footage_path, audio_file, audio_path,
         base_percent = 0.05 + 0.7 * (i + 1) / max(len(scenes), 1)
         with _progress_stdout(progress, base_percent):
             if footage:
-                assemble_video.download_clip(footage["video_link"], raw_path)
                 assemble_video.normalize_clip(
                     raw_path, norm_path, padded,
                     offset=footage.get("best_offset", 0.0),

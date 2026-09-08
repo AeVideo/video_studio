@@ -573,30 +573,52 @@ def _search_all(queries: List[str], pexels_key: str, pixabay_key: Optional[str],
                  candidates_by_id: Dict[str, Dict], orientation: str = "landscape") -> None:
     """Ищет по всем queries на Pexels, и на Pixabay если Pexels пуст.
     Дополняет candidates_by_id на месте (используется и для основного,
-    и для повторного прохода — набирает кандидатов в один общий пул)."""
+    и для повторного прохода — набирает кандидатов в один общий пул).
+
+    Запросы внутри каждого источника (Pexels/Pixabay) идут параллельно —
+    раньше QUERIES_PER_SCENE запросов шли строго по одному, добавляя ещё
+    один последовательный сетевой этап поверх скачивания картинок (см.
+    score_candidate, уже распараллелен). candidates_by_id — обычный dict,
+    запись одного ключа в CPython атомарна под GIL, отдельная блокировка
+    не нужна."""
     had_pexels_hits = False
-    for q in queries:
+
+    def _do_pexels(q: str):
         search_q = f"{q} {STYLE_SUFFIX}"
         try:
             found = search_pexels(search_q, pexels_key, orientation=orientation)
+            for c in found:
+                c["source_query"] = q  # для CLIP — чистый запрос, без стилевого суффикса
+            return found
+        except requests.HTTPError as e:
+            print(f"    Pexels ошибка на запросе '{search_q}': {e}")
+            return []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(queries), 1)) as executor:
+        for found in executor.map(_do_pexels, queries):
             if found:
                 had_pexels_hits = True
             for c in found:
-                c["source_query"] = q  # для CLIP — чистый запрос, без стилевого суффикса
                 candidates_by_id[c["id"]] = c
-        except requests.HTTPError as e:
-            print(f"    Pexels ошибка на запросе '{search_q}': {e}")
 
     if not had_pexels_hits and pixabay_key:
         print("  Pexels вернул пустой результат — пытаюсь использовать Pixabay...")
-        for q in queries:
+
+        def _do_pixabay(q: str):
             search_q = f"{q} {STYLE_SUFFIX}"
             try:
-                for c in search_pixabay(search_q, pixabay_key, orientation=orientation):
+                found = search_pixabay(search_q, pixabay_key, orientation=orientation)
+                for c in found:
                     c["source_query"] = q
-                    candidates_by_id[c["id"]] = c
+                return found
             except requests.HTTPError as e:
                 print(f"    Pixabay ошибка на запросе '{search_q}': {e}")
+                return []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(queries), 1)) as executor:
+            for found in executor.map(_do_pixabay, queries):
+                for c in found:
+                    candidates_by_id[c["id"]] = c
 
 
 def _try_archive_pool(archive_pool: List[Dict], queries: List[str], used_ids: set,
