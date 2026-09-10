@@ -2,6 +2,7 @@ import sys
 import os
 import re
 import subprocess
+import time
 
 _NOWIN = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 import json
@@ -336,14 +337,16 @@ def srt_to_animated_ass(srt_path, ass_path, video_path=None, style_slug=None, pr
                 Если None — используется чистый авто-расчёт (как раньше).
     progress_cb: необязательный callback(current, total) для GUI-прогресса.
     """
-    if not os.path.exists(srt_path):
-        print(f"Ошибка: Файл {srt_path} не найден!")
-        return False
+    for _attempt in range(10):
+        if os.path.exists(srt_path):
+            break
+        time.sleep(0.5)
+    else:
+        raise FileNotFoundError(f"Файл субтитров не найден после ожидания: {srt_path}")
 
     subtitles = parse_srt_manually(srt_path)
     if not subtitles:
-        print("Ошибка: Не удалось извлечь фразы.")
-        return False
+        raise ValueError(f"Не удалось извлечь фразы из {srt_path} (файл пуст или не в формате SRT)")
 
     width, height = get_video_resolution(video_path)
     print(f"Разрешение видео: {width}x{height}")

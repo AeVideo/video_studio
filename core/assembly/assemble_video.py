@@ -328,11 +328,9 @@ def burn_subtitles(video_path: str, srt_path: str, out_path: str, style_slug: Op
         raise RuntimeError(oasis_studio_bridge.error_message())
 
     ass_path = os.path.splitext(out_path)[0] + ".ass"
-    ok = oasis_studio_bridge.make_subs.srt_to_animated_ass(
+    oasis_studio_bridge.make_subs.srt_to_animated_ass(
         srt_path, ass_path, video_path=video_path, style_slug=style_slug,
     )
-    if not ok:
-        raise RuntimeError("make_subs.srt_to_animated_ass вернул ошибку — см. вывод выше")
 
     ass_arg = _escape_ffmpeg_filter_path(os.path.abspath(ass_path))
     vf = f"ass={ass_arg}"
