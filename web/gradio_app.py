@@ -31,6 +31,7 @@ import concurrent.futures
 import io
 import json
 import os
+import shutil
 import uuid
 
 # GRADIO_TEMP_DIR должен быть установлен ДО импорта gradio — библиотека
@@ -126,6 +127,44 @@ def _resolve_path(uploaded_file, typed_path: str, label: str = "файл"):
     if uploaded_file is not None:
         return uploaded_file.name
     return None
+
+
+def _as_path(f):
+    """Достаёт путь из значения gr.File (для автосвязки вкладок между собой,
+    без ручного скачивания/загрузки файла через браузер)."""
+    if not f:
+        return ""
+    return f.name if hasattr(f, "name") else f
+
+
+def _cleanup_intermediates(subs_srt_path, shots_json_path, footage_json_path):
+    """Удаляет промежуточные рабочие папки предыдущих этапов после того, как
+    сборка финального видео уже прошла успешно (см. .then() на assembly_btn
+    ниже — вызывается ТОЛЬКО если сборка не упала с ошибкой). Каждый этап
+    пишет результат в свою одноразовую папку (transcribe_*/shots_*/matching_*)
+    — после успешной сборки она больше не нужна и просто копится мусором на
+    диске (у "Подбор видео" там ещё и все превью-картинки кандидатов)."""
+    removed = []
+    for path in (subs_srt_path, shots_json_path, footage_json_path):
+        if not path or not os.path.exists(path):
+            continue
+        job_dir = os.path.dirname(path)
+        base = os.path.basename(job_dir)
+        try:
+            if base.startswith(("transcribe_", "shots_", "matching_")):
+                shutil.rmtree(job_dir, ignore_errors=True)
+                removed.append(job_dir)
+            else:
+                # "голый" файл не в своей job-папке (например fixed_*.srt
+                # прямо в api_jobs/) — удаляем только сам файл, никогда не
+                # трогаем родительскую папку целиком.
+                os.remove(path)
+                removed.append(path)
+        except OSError:
+            pass
+    if removed:
+        return "Промежуточные файлы удалены: " + ", ".join(removed)
+    return "Промежуточные файлы уже были удалены или не найдены — нечего чистить."
 
 
 # ---------------------------------------------------------------------------
@@ -526,13 +565,22 @@ def run_assembly_stage(footage_file, footage_path, audio_file, audio_path,
     else:
         assemble_video.mux_audio(concat_path, resolved_audio, out_path)
 
+    # Переносим готовый файл из рабочей папки (там лежат все сырые/
+    # промежуточные клипы КАЖДОГО шота — десятки файлов, часто гигабайты) в
+    # отдельную постоянную папку, и стираем саму рабочую папку целиком.
+    finished_dir = os.path.join(VIDEO_STUDIO_HOME, "output", "finished")
+    os.makedirs(finished_dir, exist_ok=True)
+    final_dest = os.path.join(finished_dir, f"video_{uuid.uuid4().hex[:10]}.mp4")
+    shutil.move(out_path, final_dest)
+    shutil.rmtree(work_dir, ignore_errors=True)
+
     progress(1.0, desc="Готово")
-    status = f"Собрано: {out_path} ({len(clip_paths)} клипов)"
+    status = f"Собрано: {final_dest} ({len(clip_paths)} клипов)"
     if placeholder_count:
         status += (f" — ВНИМАНИЕ: {placeholder_count} шот(ов) без подобранного видео "
                    f"заменены серой заглушкой ({placeholder_seconds:.1f} сек суммарно). "
                    f"Проверьте footage.json на статусы no_candidates/scoring_failed.")
-    return out_path, status
+    return final_dest, status
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +673,7 @@ def build_app() -> gr.Blocks:
             project_id = gr.Textbox(label="Имя проекта (папка в PROJECTS_ROOT)")
             script_btn = gr.Button("Сгенерировать сценарий", variant="primary")
             script_out = gr.Textbox(label="Результат", lines=10)
-            script_btn.click(
+            script_evt = script_btn.click(
                 run_script_stage,
                 inputs=[book_file, book_path, book_text_preview, duration_minutes, language, project_id, content_mode],
                 outputs=script_out,
@@ -650,7 +698,7 @@ def build_app() -> gr.Blocks:
             subs_btn = gr.Button("Распознать", variant="primary")
             subs_file_out = gr.File(label="Готовый .srt")
             subs_status_out = gr.Textbox(label="Статус")
-            subs_btn.click(
+            subs_evt = subs_btn.click(
                 run_subtitles_stage,
                 inputs=[audio_file, subs_audio_path, reference_text_file, reference_text_path, sub_language, sub_model],
                 outputs=[subs_file_out, subs_status_out],
@@ -673,7 +721,7 @@ def build_app() -> gr.Blocks:
             shots_btn = gr.Button("Развернуть в шоты", variant="primary")
             shots_file_out = gr.File(label="shots.json")
             shots_status_out = gr.Textbox(label="Статус")
-            shots_btn.click(
+            shots_evt = shots_btn.click(
                 run_shots_stage,
                 inputs=[shots_script_file, shots_script_path, shots_srt_file, shots_srt_path,
                         shots_audio_file, shots_audio_path],
@@ -694,7 +742,7 @@ def build_app() -> gr.Blocks:
             match_btn = gr.Button("Подобрать видео", variant="primary")
             match_file_out = gr.File(label="footage.json")
             match_status_out = gr.Textbox(label="Статус")
-            match_btn.click(
+            match_evt = match_btn.click(
                 run_matching_stage, inputs=[shots_file, shots_path_input, match_aspect],
                 outputs=[match_file_out, match_status_out],
             )
@@ -737,7 +785,37 @@ def build_app() -> gr.Blocks:
                 inputs=[footage_file, footage_path, assembly_audio_file, assembly_audio_path,
                         assembly_subs_file, assembly_subs_path, assembly_style, assembly_aspect],
                 outputs=[assembly_file_out, assembly_status_out],
+            ).then(
+                # Чистим промежуточные файлы ТОЛЬКО если сборка выше не
+                # упала — .then() не выполняется после ошибки в предыдущем
+                # шаге, так что при падении сборки все файлы для разбора
+                # остаются на месте.
+                _cleanup_intermediates,
+                inputs=[shots_srt_path, shots_path_input, footage_path],
+                outputs=[assembly_status_out],
             )
+
+        # ------------------------------------------------------------------
+        # Автосвязка вкладок: результат каждого шага сам попадает в поле
+        # "путь на диске" следующего шага — переключить вкладку и нажать
+        # следующую кнопку, больше ничего руками копировать не нужно.
+        # ------------------------------------------------------------------
+        script_evt.then(
+            lambda pid: os.path.join(PROJECTS_ROOT, pid, "script.json") if pid else "",
+            inputs=[project_id], outputs=[shots_script_path],
+        )
+        subs_evt.then(_as_path, inputs=[subs_file_out], outputs=[shots_srt_path])
+        subs_evt.then(_as_path, inputs=[subs_file_out], outputs=[assembly_subs_path])
+        subs_evt.then(
+            lambda af, ap: _resolve_path(af, ap, "Аудио") or "",
+            inputs=[audio_file, subs_audio_path], outputs=[shots_audio_path],
+        )
+        subs_evt.then(
+            lambda af, ap: _resolve_path(af, ap, "Аудио") or "",
+            inputs=[audio_file, subs_audio_path], outputs=[assembly_audio_path],
+        )
+        shots_evt.then(_as_path, inputs=[shots_file_out], outputs=[shots_path_input])
+        match_evt.then(_as_path, inputs=[match_file_out], outputs=[footage_path])
 
     return demo
 
