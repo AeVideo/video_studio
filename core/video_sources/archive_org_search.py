@@ -32,7 +32,31 @@ from typing import List, Dict, Optional
 
 import requests
 
-from core.video_sources.pexels_matcher import ClipScorer  # переиспользуем ту же CLIP-модель/кэш, что и для Pexels/Pixabay
+# ВАЖНО: НЕ импортировать ClipScorer из pexels_matcher.py здесь, на уровне
+# модуля — это циклический импорт (pexels_matcher.py сам импортирует этот
+# модуль) и раньше он реально ронял всю archive.org-интеграцию НАСМЕРТЬ.
+#
+# Реальная цепочка: pexels_matcher.py доходит до `from core.video_sources
+# import archive_org_search` ДО того, как в нём (ниже по файлу) определён
+# класс ClipScorer. Python начинает грузить archive_org_search.py, тот
+# пытается сделать `from core.video_sources.pexels_matcher import
+# ClipScorer` — но pexels_matcher.py уже висит в sys.modules как частично
+# загруженный (без ClipScorer, он определяется дальше по файлу), и импорт
+# падает с ImportError. Эта ImportError долетает до pexels_matcher.py,
+# где ловится строкой `except ImportError: archive_org_search = None`.
+#
+# Так как оба реальных входа в пайплайн (desktop/video_pipeline_gui/workers.py
+# и web/gradio_app.py) импортируют СНАЧАЛА pexels_matcher, а не
+# archive_org_search напрямую — этот ImportError происходит АБСОЛЮТНО
+# каждый раз. `pexels_matcher.archive_org_search` оказывается None на
+# каждом реальном запуске, MatchWorker.run() видит `if ... is not None`
+# и тихо пропускает построение всего archive.org-пула — без единой
+# ошибки или предупреждения в логах. Archive.org-матчинг был живым кодом,
+# который ни разу не выполнился в проде, хотя изолированные тесты (без
+# такого порядка импорта) его подтверждали.
+#
+# ClipScorer реально нужен здесь только в CLI main() ниже — импортируем
+# его там же, лениво, когда оба модуля уже полностью загружены.
 
 SEARCH_URL = "https://archive.org/advancedsearch.php"
 METADATA_URL = "https://archive.org/metadata/{identifier}"
@@ -519,6 +543,7 @@ def main():
         if args.find_offset and i == 0:
             duration = float(video_file.get("length") or 0.0)
             print(f"  Ищу лучший таймкод под запрос '{args.query}' ({OFFSET_SAMPLE_COUNT} сэмплов)...")
+            from core.video_sources.pexels_matcher import ClipScorer  # ленивый импорт — см. комментарий вверху файла
             scorer = ClipScorer()
             found = find_best_offset(video_file["download_url"], duration, args.query, scorer)
             if found:

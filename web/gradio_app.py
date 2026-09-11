@@ -266,7 +266,7 @@ def run_script_stage(book_file, book_path, book_text_preview, duration_minutes, 
     progress(0.05, desc="Разбиваю источник на истории...")
     client = book_to_script.get_client()
 
-    stories = book_to_script.split_book_into_stories(book_text, client)
+    stories = book_to_script.split_book_into_stories(book_text, client, language=language)
     if not stories:
         raise gr.Error("Не удалось выделить ни одной истории из источника")
 

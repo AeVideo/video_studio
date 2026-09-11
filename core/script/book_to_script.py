@@ -107,12 +107,27 @@ SPLIT_SYSTEM_PROMPT = """Ты — редактор документальных 
 не выдумывай, верни столько, сколько реально есть."""
 
 
-def split_book_into_stories(book_text: str, client: OpenAI, model: str = DEEPSEEK_MODEL_DEFAULT) -> List[Dict]:
+def split_book_into_stories(
+    book_text: str, client: OpenAI, model: str = DEEPSEEK_MODEL_DEFAULT, language: str = "ru"
+) -> List[Dict]:
+    # Раньше этот шаг вообще не знал про целевой язык ролика — если источник
+    # (например, рассекреченное дело FBI/CIA) на английском, title/summary
+    # возвращались на английском. Дальше они подставляются в user_content
+    # write_script_for_story ПЕРЕД инструкцией "Язык: ru", усиливая англоязычный
+    # контекст и утягивая туда же итоговый закадровый текст. source_excerpt
+    # обязан остаться на языке оригинала — иначе по нему не найти кусок в
+    # source_text для последующей нарезки.
+    user_content = (
+        f"Язык для полей title и summary в ответе: {language}. "
+        f"Поле source_excerpt — ИСКЛЮЧЕНИЕ: оставь дословно на языке текста "
+        f"ниже, не переводи (он используется для поиска этого места в исходнике).\n\n"
+        f"{book_text}"
+    )
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": SPLIT_SYSTEM_PROMPT},
-            {"role": "user", "content": book_text},
+            {"role": "user", "content": user_content},
         ],
         temperature=0.3,
         max_tokens=4000,  # с запасом под список историй с summary — не сама книга, а метаданные по ней
@@ -213,6 +228,32 @@ SCRIPT_SYSTEM_PROMPTS = {
 }
 
 
+# Языки, где легко проверить попадание по алфавиту без внешних библиотек
+# (langdetect и т.п. в проекте нет). Для de/en/es надёжной дешёвой проверки
+# без доп. зависимостей нет — сознательно не проверяем, чтобы не давать
+# ложных срабатываний; сам зафиксированный баг был именно "вместо кириллицы
+# пришла латиница", и именно этот случай проверка ловит.
+_CYRILLIC_LANGS = {"ru", "uk"}
+
+
+def _verify_narration_language(script: List[Dict], language: str, context_label: str) -> None:
+    if language not in _CYRILLIC_LANGS:
+        return
+    all_text = "".join(s.get("text", "") for s in script)
+    letters = [c for c in all_text if c.isalpha()]
+    if not letters:
+        return
+    cyrillic = sum(1 for c in letters if "а" <= c.lower() <= "я" or c.lower() in ("ё", "і", "ї", "є", "ґ"))
+    ratio = cyrillic / len(letters)
+    if ratio < 0.5:
+        sample = all_text[:200]
+        raise RuntimeError(
+            f"{context_label}: запрошен язык '{language}', но результат в основном "
+            f"НЕ на кириллице (доля кириллических букв: {ratio:.0%}). Похоже на языковой "
+            f"дрейф к языку исходника вместо целевого. Начало текста: {sample!r}"
+        )
+
+
 def write_script_for_story(
     story: Dict,
     source_text: str,
@@ -239,7 +280,17 @@ def write_script_for_story(
         f"(~{target_chars} символов текста озвучки, допуск ±10%)\n\n"
         f"История: {story['title']}\n"
         f"Краткое содержание: {story['summary']}\n\n"
-        f"Исходный материал:\n{source_text}"
+        f"Исходный материал:\n{source_text}\n\n"
+        # Повтор инструкции ПОСЛЕ исходника — намеренно. Если исходный материал
+        # (и, возможно, title/summary из предыдущего шага) на другом языке, эта
+        # единственная строка "Язык: ru" в начале письма тонет в объёме исходника
+        # и модель по инерции продолжает на языке источника. Напоминание в самом
+        # конце, ближе всего к точке генерации, куда сильнее влияет на то, на
+        # каком языке модель фактически начнёт писать.
+        f"НАПОМИНАНИЕ: независимо от языка материала выше, поле \"text\" в "
+        f"каждой сцене должно быть написано НА ЯЗЫКЕ '{language}', а не на "
+        f"языке исходника. Не копируй и не переводи буквально куски исходника — "
+        f"перескажи своими словами на {language}."
     )
     # Лимит вывода считаем от реальной длительности видео, а не берём
     # фиксированную цифру — 500 токенов достаточно для карточки, но обрежет
@@ -258,7 +309,9 @@ def write_script_for_story(
         # съедает max_output_tokens на рассуждения и content приходит пустым
         extra_body={"thinking": {"type": "disabled"}},
     )
-    return _parse_json_response(response, context_label="write_script_for_story")
+    script = _parse_json_response(response, context_label="write_script_for_story")
+    _verify_narration_language(script, language, context_label="write_script_for_story")
+    return script
 
 
 # ---------- 3. CLI ----------
@@ -282,7 +335,7 @@ def main():
     client = get_client()
 
     print("Разбиваю источник на самостоятельные истории...")
-    stories = split_book_into_stories(book_text, client)
+    stories = split_book_into_stories(book_text, client, language=args.language)
     print(f"Найдено историй: {len(stories)}")
 
     if not stories:

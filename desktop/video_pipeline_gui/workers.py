@@ -103,7 +103,7 @@ class ScriptWorker(QThread):
                 book_text = f.read()
 
             self.log_line.emit("Разбиваю источник на самостоятельные истории...")
-            stories = book_to_script.split_book_into_stories(book_text, client)
+            stories = book_to_script.split_book_into_stories(book_text, client, language=self.language)
             if not stories:
                 self.finished_ok.emit(False, "Не удалось выделить ни одной истории")
                 return
