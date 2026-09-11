@@ -31,3 +31,8 @@ browser_profiles/
 video_studio_home/
 projects/
 projects/
+
+# Рабочие артефакты по факту оказались за пределами storage/ (см. выше) —
+# api_jobs пишет прямо в ./output/ при некоторых сценариях запуска
+output/
+*.patch
