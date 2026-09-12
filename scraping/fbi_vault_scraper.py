@@ -152,10 +152,12 @@ def extract_text_ocr(pdf_path: str, dpi: int = 150, lang: str = "eng",
                                    last_page=max_pages)
         total = len(paths)
         text_parts = []
+        skipped_blank = 0
         for i, img_path in enumerate(paths, 1):
             img = Image.open(img_path)
             if skip_blank_pages and _page_is_mostly_blank(img):
                 print(f"        страница {i}/{total}: почти пустая, OCR пропущен", flush=True)
+                skipped_blank += 1
                 img.close()
                 os.remove(img_path)
                 continue
@@ -163,6 +165,28 @@ def extract_text_ocr(pdf_path: str, dpi: int = 150, lang: str = "eng",
             text_parts.append(pytesseract.image_to_string(img, lang=lang))
             img.close()
             os.remove(img_path)
+
+        # Реальный случай: в Colab процесс "отрапортовал успех" (все страницы
+        # прошли цикл без единого исключения), но итоговый текст оказался
+        # пустым — потому что эвристика _page_is_mostly_blank сработала на
+        # ВСЕХ страницах подряд (например, из-за другой версии poppler на
+        # Colab, дающей более светлый рендер при том же dpi, чем локально,
+        # где эвристика калибровалась). Раньше это тихо возвращало "" —
+        # выглядело как "всё ок, но ничего не нашли", хотя проблема была в
+        # самой эвристике, а не в PDF. Явно различаем "документ реально
+        # пустой" (0 страниц) от "эвристика решила, что пустые ВСЕ страницы"
+        # (total > 0, но skipped_blank == total) — второе почти наверняка баг
+        # эвристики/окружения, а не свойство документа.
+        if total > 0 and skipped_blank == total:
+            raise RuntimeError(
+                f"OCR: все {total} страниц {pdf_path} распознаны эвристикой "
+                f"_page_is_mostly_blank как 'почти пустые' и пропущены — итоговый "
+                f"текст был бы пустым молча. Скорее всего расхождение рендеринга "
+                f"PDF->изображение между окружениями (другая версия poppler/dpi), "
+                f"а не то, что документ реально пустой. Проверьте вручную "
+                f"одну из страниц (сохранить с skip_blank_pages=False) или "
+                f"понизьте blank_ratio в _page_is_mostly_blank."
+            )
         return "\n".join(text_parts).strip()
 
 

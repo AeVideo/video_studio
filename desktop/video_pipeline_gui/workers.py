@@ -114,9 +114,12 @@ class ScriptWorker(QThread):
                 json.dump(backlog, f, ensure_ascii=False, indent=2)
 
             self.log_line.emit(f"Пишу сценарий для: {first['title']}")
+            from core.script.calibration import get_calibrated_chars_per_minute
+            chars_per_minute = get_calibrated_chars_per_minute(book_to_script.CHARS_PER_MINUTE_DEFAULT)
             script = book_to_script.write_script_for_story(
                 story=first, source_text=book_text, duration_minutes=self.duration_minutes,
                 language=self.language, client=client, content_mode=self.content_mode,
+                chars_per_minute=chars_per_minute,
             )
 
             script_path = os.path.join(self.out_dir, "script.json")
@@ -149,6 +152,19 @@ class SubtitlesWorker(QThread):
 
     def run(self):
         self.log_line.emit("Проверяю subtitle_service...")
+
+        # Калибровка симв/мин по РЕАЛЬНОЙ готовой озвучке — не зависит от
+        # того, успеет ли дальше subtitle_service (транскрипция может упасть
+        # по своим причинам), поэтому делаем это первым делом, а не в конце.
+        # См. core/script/calibration.py — раньше вместо этого замера везде
+        # использовалась захардкоженная угаданная цифра (900 симв/мин),
+        # которая разошлась с реальным темпом речи диктора.
+        try:
+            from core.script.calibration import record_calibration_sample
+            record_calibration_sample(self.narration_text_path, self.audio_path)
+        except Exception as e:
+            self.log_line.emit(f"Калибровка темпа речи пропущена (не критично): {e}")
+
         if not ensure_subtitle_service():
             self.finished_ok.emit(False, "Не удалось запустить subtitle_service")
             return

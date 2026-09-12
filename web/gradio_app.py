@@ -283,10 +283,13 @@ def run_script_stage(book_file, book_path, book_text_preview, duration_minutes, 
         json.dump(backlog, f, ensure_ascii=False, indent=2)
 
     progress(0.4, desc=f"Пишу сценарий для: {first['title']}")
+    from core.script.calibration import get_calibrated_chars_per_minute
+    chars_per_minute = get_calibrated_chars_per_minute(book_to_script.CHARS_PER_MINUTE_DEFAULT)
     try:
         script = book_to_script.write_script_for_story(
             story=first, source_text=book_text, duration_minutes=duration_minutes,
             language=language, client=client, content_mode=content_mode,
+            chars_per_minute=chars_per_minute,
         )
     except Exception as e:
         raise gr.Error(f"Ошибка на этапе написания сценария: {e}") from e
