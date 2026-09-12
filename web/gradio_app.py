@@ -266,7 +266,15 @@ def run_script_stage(book_file, book_path, book_text_preview, duration_minutes, 
     progress(0.05, desc="Разбиваю источник на истории...")
     client = book_to_script.get_client()
 
-    stories = book_to_script.split_book_into_stories(book_text, client, language=language)
+    # Раньше вызовы DeepSeek ничем не были обёрнуты — голое исключение (таймаут
+    # на огромном промпте, finish_reason='length', невалидный JSON и т.п.)
+    # не оборачивается Gradio в читаемое сообщение само по себе. Пользователь
+    # видел просто "результат ноль" без объяснения, хотя реальная причина
+    # была в логах/трейсбеке, а не в интерфейсе.
+    try:
+        stories = book_to_script.split_book_into_stories(book_text, client, language=language)
+    except Exception as e:
+        raise gr.Error(f"Ошибка на этапе разбивки источника на истории: {e}") from e
     if not stories:
         raise gr.Error("Не удалось выделить ни одной истории из источника")
 
@@ -275,10 +283,13 @@ def run_script_stage(book_file, book_path, book_text_preview, duration_minutes, 
         json.dump(backlog, f, ensure_ascii=False, indent=2)
 
     progress(0.4, desc=f"Пишу сценарий для: {first['title']}")
-    script = book_to_script.write_script_for_story(
-        story=first, source_text=book_text, duration_minutes=duration_minutes,
-        language=language, client=client, content_mode=content_mode,
-    )
+    try:
+        script = book_to_script.write_script_for_story(
+            story=first, source_text=book_text, duration_minutes=duration_minutes,
+            language=language, client=client, content_mode=content_mode,
+        )
+    except Exception as e:
+        raise gr.Error(f"Ошибка на этапе написания сценария: {e}") from e
 
     script_path = os.path.join(out_dir, "script.json")
     with open(script_path, "w", encoding="utf-8") as f:
