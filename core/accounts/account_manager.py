@@ -1,7 +1,7 @@
 """
 account_manager.py
 
-Управление API-ключами (Pexels, Pixabay, DeepSeek) и Flow-аккаунтами
+Управление API-ключами (Pexels, Pixabay, DeepSeek, DashScope) и Flow-аккаунтами
 с дневными лимитами, ротацией и persistent-профилями.
 
 Ключи НЕ сохраняются в JSON-файл конфигурации (чтобы не коммитить секреты).
@@ -9,6 +9,7 @@ account_manager.py
   - PEXELS_API_KEY
   - PIXABAY_API_KEY
   - DEEPSEEK_API_KEY
+  - DASHSCOPE_API_KEY  (Alibaba Cloud Model Studio — то же имя, что в их SDK)
 
 Flow-аккаунты могут загружаться:
   1) из JSON-файла (через config_path) в формате {"accounts": [...]}
@@ -21,9 +22,12 @@ Flow-аккаунты могут загружаться:
 """
 
 import json
+import logging
 import os
 from datetime import date, datetime
 from typing import Dict, Optional, List, Any
+
+logger = logging.getLogger(__name__)
 
 
 class AccountManager:
@@ -52,8 +56,10 @@ class AccountManager:
         self.accounts: List[Dict[str, Any]] = accounts if accounts is not None else []
 
         if config_path:
+            self.config_path = config_path
             self.load_config(config_path)
         else:
+            self.config_path = None
             self._load_from_env()
 
         # Начальный индекс для round-robin ротации
@@ -74,7 +80,7 @@ class AccountManager:
     def _load_from_env(self) -> None:
         """Загружает API-ключи и accounts из переменных окружения."""
         # API-ключи
-        for service in ("pexels", "pixabay", "deepseek"):
+        for service in ("pexels", "pixabay", "deepseek", "dashscope"):
             env_key = f"{service.upper()}_API_KEY"
             if os.getenv(env_key):
                 self.api_keys[service] = os.environ[env_key]
@@ -161,6 +167,7 @@ class AccountManager:
             if acc["id"] == account_id:
                 acc["daily_count"] = acc.get("daily_count", 0) + 1
                 acc["last_success"] = date.today().isoformat()
+                self._persist_if_configured()
                 return
 
     def mark_quota_exhausted(self, account_id: str) -> None:
@@ -168,18 +175,49 @@ class AccountManager:
         for acc in self.accounts:
             if acc["id"] == account_id:
                 acc["quota_exhausted"] = True
+                self._persist_if_configured()
                 return
 
     def reset_daily_counts_if_new_day(self) -> None:
         """
-        Если last_success отличается от сегодняшней даты (или отсутствует) —
-        сбрасывает daily_count и quota_exhausted.
+        Сбрасывает daily_count/quota_exhausted раз в сутки.
+
+        ВАЖНО: раньше проверка "новый ли день" делалась по last_success —
+        но у аккаунта, который исчерпал лимит НИ РАЗУ не выполнив задачу
+        успешно, last_success остаётся None, а None != today истинно
+        всегда. Это сбрасывало quota_exhausted обратно на False при КАЖДОМ
+        создании AccountManager (а не раз в сутки), сводя на нет саму
+        персистентность — баг был незаметен, пока состояние вообще нигде
+        не сохранялось. Используем отдельное поле last_reset_date, не
+        зависящее от того, был ли вообще успех.
         """
         today = date.today().isoformat()
+        changed = False
         for acc in self.accounts:
-            if acc.get("last_success") != today:
+            if acc.get("last_reset_date") != today:
+                if acc.get("daily_count", 0) != 0 or acc.get("quota_exhausted", False):
+                    changed = True
                 acc["daily_count"] = 0
                 acc["quota_exhausted"] = False
+                acc["last_reset_date"] = today
+                changed = True  # первая простановка last_reset_date тоже требует сохранения
+        if changed:
+            self._persist_if_configured()
+
+    def _persist_if_configured(self) -> None:
+        """
+        Раньше mark_success/mark_quota_exhausted меняли self.accounts только
+        в памяти — без явного вызова save_config() состояние (кто исчерпал
+        лимит, у кого сколько успехов сегодня) терялось при каждом
+        перезапуске приложения, и весь механизм дневных лимитов не работал
+        сквозь рестарты. Теперь при наличии config_path (передан явно или
+        через который был вызван load_config) сохраняем автоматически.
+        """
+        if self.config_path:
+            try:
+                self.save_config(self.config_path)
+            except OSError as e:
+                logger.warning(f"Не удалось сохранить состояние аккаунтов в {self.config_path}: {e}")
 
     # ------------------------------------------------------------------ #
     # Сохранение конфигурации (только аккаунты, без ключей)
