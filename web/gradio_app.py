@@ -502,10 +502,17 @@ def run_assembly_stage(footage_file, footage_path, audio_file, audio_path,
     # одновременных сессий аппаратного энкодера и либо тормозить друг
     # друга, либо падать вместо ускорения.
     download_tasks = []
+    photo_download_tasks = []
     for i, scene in enumerate(scenes):
         footage = scene.get("footage")
         duration = round(scene["end"] - scene["start"], 2)
         if duration <= 0 or not footage:
+            continue
+        if footage.get("source") == "photo_collage":
+            # Не видео — скачивать через download_clip нечего, картинки
+            # тянем отдельно (см. цикл ниже) под коллаж.
+            for j, url in enumerate(footage.get("picture_urls", [])):
+                photo_download_tasks.append((i, j, url))
             continue
         raw_path = os.path.join(work_dir, f"raw_{i}.mp4")
         download_tasks.append((i, footage, raw_path))
@@ -523,6 +530,22 @@ def run_assembly_stage(footage_file, footage_path, audio_file, audio_path,
             for _ in executor.map(_download_one, download_tasks):
                 pass
 
+    # Фото для коллажей — отдельным пулом, тем же паттерном, что видео.
+    photo_local_paths = {}
+    _photo_scorer = pexels_matcher.ClipScorer()
+
+    def _download_photo(task):
+        i, j, url = task
+        dest = os.path.join(work_dir, f"photo_{i}_{j}.jpg")
+        with _progress_stdout(progress, 0.02):
+            _photo_scorer.download_image_url(url, dest)
+        return (i, j), dest
+
+    if photo_download_tasks:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            for key, dest in executor.map(_download_photo, photo_download_tasks):
+                photo_local_paths[key] = dest
+
     # Фаза 2: нормализация/кодирование — последовательно.
     for i, scene in enumerate(scenes):
         footage = scene.get("footage")
@@ -538,7 +561,23 @@ def run_assembly_stage(footage_file, footage_path, audio_file, audio_path,
 
         base_percent = 0.05 + 0.7 * (i + 1) / max(len(scenes), 1)
         with _progress_stdout(progress, base_percent):
-            if footage:
+            if footage and footage.get("source") == "photo_collage":
+                # Видео не нашлось, но нашлось уверенное фото (score >=
+                # PHOTO_SCORE_THRESHOLD в match_scene) — коллаж вместо плёнки.
+                paths = [photo_local_paths[(i, j)] for j in range(len(footage.get("picture_urls", [])))
+                         if (i, j) in photo_local_paths]
+                if paths:
+                    print(f"    фото-фолбэк для {scene['id']} (score={footage.get('score')}) — коллаж, {padded}с")
+                    assemble_video.generate_collage_clip(norm_path, padded, paths,
+                                                          target_width=target_width, target_height=target_height)
+                else:
+                    # Скачивание фото не удалось ни для одной картинки — откатываемся на плёнку.
+                    print(f"    фото для {scene['id']} не скачались — вставляю плёнку {padded}с")
+                    assemble_video.generate_film_damage_clip(norm_path, padded,
+                                                              target_width=target_width, target_height=target_height)
+                    placeholder_count += 1
+                    placeholder_seconds += duration
+            elif footage:
                 assemble_video.normalize_clip(
                     raw_path, norm_path, padded,
                     offset=footage.get("best_offset", 0.0),
@@ -549,10 +588,10 @@ def run_assembly_stage(footage_file, footage_path, audio_file, audio_path,
                 # Раньше здесь было continue — молча пропускало шот, из-за
                 # чего видео-дорожка отставала от полной озвучки НАЧИНАЯ с
                 # этого места, а не только в конце (см. комментарий в
-                # assemble_video.generate_placeholder_clip). Плейсхолдер
-                # держит тайминги видео=аудио всегда.
-                print(f"    нет footage для {scene['id']} — вставляю плейсхолдер {padded}с")
-                assemble_video.generate_placeholder_clip(norm_path, padded,
+                # assemble_video.generate_placeholder_clip). Теперь — имитация
+                # обрыва плёнки вместо серой плашки, держит те же тайминги.
+                print(f"    нет footage для {scene['id']} — вставляю плёнку {padded}с")
+                assemble_video.generate_film_damage_clip(norm_path, padded,
                                                           target_width=target_width, target_height=target_height)
                 placeholder_count += 1
                 placeholder_seconds += duration

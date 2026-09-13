@@ -206,6 +206,67 @@ def generate_placeholder_clip(dest: str, duration: float,
         raise
 
 
+def generate_collage_clip(dest: str, duration: float, image_local_paths: List[str],
+                           target_width: int = TARGET_WIDTH, target_height: int = TARGET_HEIGHT):
+    """Фолбэк, когда видео не нашлось, но нашлось 1-3 фото с высоким
+    CLIP-score (см. _try_photo_fallback в pexels_matcher.py). Собирает
+    Pillow-коллаж (core/assembly/collage.py) и оживляет его медленным
+    наездом через zoompan — та же роль в тайминге, что у
+    generate_placeholder_clip (точная длительность = видео не отстаёт
+    от озвучки), но выглядит как архивные фото, а не серая плашка."""
+    from core.assembly.collage import build_photo_collage, apply_archival_grade
+    tmp_raw = dest + "_collage_raw.jpg"
+    tmp_graded = dest + "_collage.jpg"
+    try:
+        build_photo_collage(image_local_paths, tmp_raw, canvas_w=target_width, canvas_h=target_height)
+        apply_archival_grade(tmp_raw, tmp_graded)
+        zoom_rate = 0.12 / max(duration * TARGET_FPS, 1)
+        vf = (f"scale={target_width}:{target_height},"
+              f"zoompan=z='min(zoom+{zoom_rate},1.12)':"
+              f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+              f"d=1:s={target_width}x{target_height}:fps={TARGET_FPS}")
+        cmd_prefix = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                      "-loop", "1", "-i", tmp_graded, "-vf", vf, "-t", str(duration)]
+        _run_encode(cmd_prefix, [dest])
+    except Exception:
+        _cleanup(dest)
+        raise
+    finally:
+        for f in (tmp_raw, tmp_graded):
+            if os.path.exists(f):
+                os.remove(f)
+
+
+def generate_film_damage_clip(dest: str, duration: float,
+                               target_width: int = TARGET_WIDTH, target_height: int = TARGET_HEIGHT):
+    """Клип-заглушка на самый крайний случай — НИ видео, НИ уверенное фото
+    не нашлись (см. приоритет в match_scene). Имитация обрыва киноплёнки
+    (засвет + зерно + процедурные царапины + дрожание кадра) вместо
+    сплошной серой плашки — держит те же тайминги видео=аудио, что и
+    generate_placeholder_clip."""
+    src_h = target_height + 16
+    flash1_t = duration * 0.04
+    flash2_t = duration * 0.7
+    vf = (
+        f"noise=alls=70:allf=t+u,"
+        f"eq=brightness='0.9*exp(-((t-{flash1_t})/0.07)^2)"
+        f"+0.35*exp(-((t-{flash2_t})/0.05)^2)':eval=frame,"
+        f"geq=lum='lum(X,Y)+230*if(lt(mod(X+41*N,317),3),1,0)"
+        f"+200*if(lt(mod(X+193*N,401),2),1,0)':cb=128:cr=128,"
+        f"crop={target_width}:{target_height}:0:'8+8*sin(16*PI*t)'"
+    )
+    cmd_prefix = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-f", "lavfi", "-i", f"color=black:s={target_width}x{src_h}:d={duration}:r={TARGET_FPS}",
+        "-vf", vf,
+    ]
+    try:
+        _run_encode(cmd_prefix, [dest])
+    except Exception:
+        _cleanup(dest)
+        raise
+
+
 def normalize_clip(src: str, dest: str, duration: float, offset: float = 0.0, source_duration: float = 0.0,
                     target_width: int = TARGET_WIDTH, target_height: int = TARGET_HEIGHT):
     """Приводит клип к единому разрешению/fps/без звука и точно нужной длительности

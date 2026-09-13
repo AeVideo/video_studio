@@ -53,11 +53,17 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL_DEFAULT = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 PEXELS_SEARCH_URL = "https://api.pexels.com/videos/search"
 PIXABAY_SEARCH_URL = "https://pixabay.com/api/videos/"
+PEXELS_PHOTO_SEARCH_URL = "https://api.pexels.com/v1/search"
+PIXABAY_PHOTO_SEARCH_URL = "https://pixabay.com/api/"
 
 QUERIES_PER_SCENE = 4
 CANDIDATES_PER_QUERY = 8
 MAX_PICTURES_PER_CANDIDATE = 10
-SCORE_THRESHOLD = 0.24  # эмпирический порог для ViT-B-32; откалибруйте по своим результатам
+SCORE_THRESHOLD = 0.30  # поднято с 0.24 — было слишком щедро для ViT-B-32
+# Порог для фото-фолбэка — заметно строже видео: фото ставим вместо
+# слабого видео, только когда оно реально уверенное совпадение, а не
+# "первое попавшееся" (см. обсуждение в чате).
+PHOTO_SCORE_THRESHOLD = 0.35
 
 # CLIP_MODEL_NAME/CLIP_PRETRAINED НЕ переключаются автоматически по устройству
 # (в отличие от asr.transcribe.default_model()) — намеренно. Whisper просто
@@ -381,6 +387,123 @@ def search_pixabay(query: str, api_key: str, per_page: int = CANDIDATES_PER_QUER
     candidates.sort(key=lambda c: (c["width"] or 0) > (c["height"] or 0) if wants_portrait
                      else (c["width"] or 0) < (c["height"] or 0))
     return candidates
+
+
+# ---------- 2b. Поиск ФОТО (не видео) — фолбэк, когда видео не нашлось ----------
+
+def search_pexels_photos(query: str, api_key: str, per_page: int = CANDIDATES_PER_QUERY,
+                          orientation: str = "landscape") -> List[Dict]:
+    headers = {"Authorization": api_key}
+    params = {"query": query, "per_page": per_page, "orientation": orientation}
+    resp = requests.get(PEXELS_PHOTO_SEARCH_URL, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    candidates = []
+    for photo in data.get("photos", []):
+        candidates.append({
+            "id": f"pexels_photo_{photo['id']}",
+            "picture_url": photo["src"]["large2x"],
+            "source_query": query,
+            "source": "pexels_photo",
+        })
+    return candidates
+
+
+def search_pixabay_photos(query: str, api_key: str, per_page: int = CANDIDATES_PER_QUERY) -> List[Dict]:
+    """Pixabay image API не имеет параметра orientation для фото (как и video API) —
+    честного серверного фильтра нет, сортировку по ориентации при желании можно
+    добавить так же, как в search_pixabay, но для фолбэка это менее критично."""
+    params = {
+        "key": api_key, "q": query, "image_type": "photo",
+        "per_page": max(per_page, 3), "safesearch": "true",
+    }
+    resp = requests.get(PIXABAY_PHOTO_SEARCH_URL, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    candidates = []
+    for photo in data.get("hits", []):
+        url = photo.get("largeImageURL")
+        if not url:
+            continue
+        candidates.append({
+            "id": f"pixabay_photo_{photo['id']}",
+            "picture_url": url,
+            "source_query": query,
+            "source": "pixabay_photo",
+        })
+    return candidates
+
+
+def _search_all_photos(queries: List[str], pexels_key: str, pixabay_key: Optional[str],
+                        orientation: str = "landscape") -> Dict[str, Dict]:
+    by_id: Dict[str, Dict] = {}
+    for q in queries:
+        try:
+            for c in search_pexels_photos(q, pexels_key, orientation=orientation):
+                by_id.setdefault(c["id"], c)
+        except Exception as e:
+            print(f"    Pexels photo поиск не удался для '{q}': {e}")
+        if pixabay_key:
+            try:
+                for c in search_pixabay_photos(q, pixabay_key):
+                    by_id.setdefault(c["id"], c)
+            except Exception as e:
+                print(f"    Pixabay photo поиск не удался для '{q}': {e}")
+    return by_id
+
+
+def _score_photo_pool(pool: List[Dict], clip_scorer: "ClipScorer") -> List[Dict]:
+    """Возвращает кандидатов, отсортированных по score (убывание) —
+    не только лучшего, чтобы можно было собрать коллаж из top-N."""
+    if not pool:
+        return []
+    query_embeddings: Dict[str, Optional[torch.Tensor]] = {}
+    for c in pool:
+        q = c["source_query"]
+        if q not in query_embeddings:
+            try:
+                query_embeddings[q] = clip_scorer.embed_text(q)
+            except Exception:
+                query_embeddings[q] = None
+
+    scored = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {}
+        for c in pool:
+            text_emb = query_embeddings.get(c["source_query"])
+            if text_emb is None:
+                continue
+            futures[executor.submit(clip_scorer.embed_image_url, c["picture_url"])] = (c, text_emb)
+        for future in concurrent.futures.as_completed(futures):
+            cand, text_emb = futures[future]
+            img_emb = future.result()
+            if img_emb is None:
+                continue
+            score = (img_emb @ text_emb.T).item()
+            scored.append({"candidate": cand, "score": round(score, 4)})
+
+    scored.sort(key=lambda r: r["score"], reverse=True)
+    return scored
+
+
+def _try_photo_fallback(queries: List[str], pexels_key: str, pixabay_key: Optional[str],
+                         clip_scorer: "ClipScorer", orientation: str, max_photos: int = 3) -> Optional[Dict]:
+    """Ищет фото по тем же запросам, что уже пробовались для видео, и
+    возвращает до max_photos лучших, ЕСЛИ верхний score прошёл
+    PHOTO_SCORE_THRESHOLD. Иначе — None (тогда снаружи решают: оставить
+    слабое видео или в итоге плёнку)."""
+    pool = list(_search_all_photos(queries, pexels_key, pixabay_key, orientation=orientation).values())
+    scored = _score_photo_pool(pool, clip_scorer)
+    if not scored or scored[0]["score"] < PHOTO_SCORE_THRESHOLD:
+        return None
+    top = [r for r in scored[:max_photos] if r["score"] >= PHOTO_SCORE_THRESHOLD]
+    return {
+        "picture_urls": [r["candidate"]["picture_url"] for r in top],
+        "score": top[0]["score"],
+        "sources": [r["candidate"]["source"] for r in top],
+    }
 
 
 # ---------- 3. Локальный CLIP: модель, эмбеддинги, скоринг ----------
@@ -749,15 +872,33 @@ def match_scene(scene: Dict, deepseek_client: OpenAI, clip_scorer: ClipScorer, p
         }
 
     if not candidates_by_id:
+        photo = _try_photo_fallback(tried_queries, pexels_key, pixabay_key, clip_scorer, orientation)
+        if photo:
+            return {**scene, "footage": {"source": "photo_collage", **photo}, "status": "matched_photo",
+                    "tried_queries": tried_queries}
         return {**scene, "footage": None, "status": "no_candidates", "tried_queries": tried_queries}
 
     if best is None:
+        photo = _try_photo_fallback(tried_queries, pexels_key, pixabay_key, clip_scorer, orientation)
+        if photo:
+            return {**scene, "footage": {"source": "photo_collage", **photo}, "status": "matched_photo",
+                    "tried_queries": tried_queries}
         return {**scene, "footage": None, "status": "scoring_failed", "tried_queries": tried_queries}
 
     used_ids.add(best["candidate"]["id"])
     status = "matched" if best["score"] >= SCORE_THRESHOLD else "low_confidence"
     if reused:
         status = "reused_fallback"
+
+    # Видео слабое (или это вынужденный повтор кандидата) — проверяем,
+    # нет ли уверенного фото получше, ПРЕЖДЕ чем соглашаться на слабое видео.
+    # Ищем фото только в этом случае (не на каждой сцене) — так и точнее,
+    # и не замедляет сцены, где видео и так нашлось хорошо.
+    if status in ("low_confidence", "reused_fallback"):
+        photo = _try_photo_fallback(tried_queries, pexels_key, pixabay_key, clip_scorer, orientation)
+        if photo and photo["score"] > best["score"]:
+            return {**scene, "footage": {"source": "photo_collage", **photo}, "status": "matched_photo",
+                    "tried_queries": tried_queries}
 
     thumbnail_path = None
     picture_url = best.get("best_picture_url")
