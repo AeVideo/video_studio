@@ -34,7 +34,7 @@ load_dotenv()  # подхватывает .env из текущей папки �
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL_DEFAULT = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-CHARS_PER_MINUTE_DEFAULT = 900  # эмпирический темп речи, откалибруйте под свой TTS-голос
+CHARS_PER_MINUTE_DEFAULT = 1700  # эмпирический темп речи, откалибруйте под свой TTS-голос
 
 
 def get_client() -> OpenAI:
