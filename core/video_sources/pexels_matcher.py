@@ -281,27 +281,38 @@ def generate_archive_theme_queries(story_summary: str, client: OpenAI,
     """Вызывается ОДИН раз на весь проект (не на сцену) — стоимость одного
     лишнего вызова DeepSeek ничтожна по сравнению с тем, сколько archive.org
     per-сцена запросов эта функция заменяет собой."""
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": ARCHIVE_THEME_SYSTEM_PROMPT},
-                {"role": "user", "content": story_summary},
-            ],
-            temperature=0.4,
-            max_tokens=400,
-            extra_body={"thinking": {"type": "disabled"}},
-        )
-        raw = _strip_json_fence(response.choices[0].message.content)
-        if not raw:
-            finish_reason = response.choices[0].finish_reason
-            raise ValueError(f"пустой content, finish_reason={finish_reason!r}")
-        data = json.loads(raw)
-        themes = data["themes"]
-        if themes:
-            return themes
-    except Exception as e:
-        print(f"  ! Не удалось получить темы для archive.org ({e}) — archive.org в этом прогоне не используется")
+    import time
+    # Вызывается ОДИН раз на весь проект — без повтора один сетевой сбой
+    # (нередкий на Colab) тихо выключал archive.org на всё видео целиком.
+    # 3 попытки с паузой заметно надёжнее одной.
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": ARCHIVE_THEME_SYSTEM_PROMPT},
+                    {"role": "user", "content": story_summary},
+                ],
+                temperature=0.4,
+                max_tokens=400,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            raw = _strip_json_fence(response.choices[0].message.content)
+            if not raw:
+                finish_reason = response.choices[0].finish_reason
+                raise ValueError(f"пустой content, finish_reason={finish_reason!r}")
+            data = json.loads(raw)
+            themes = data["themes"]
+            if themes:
+                return themes
+            return []
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                print(f"  ! Попытка {attempt + 1}/3 получить темы для archive.org не удалась ({e}) — повтор через 3с")
+                time.sleep(3)
+    print(f"  ! Не удалось получить темы для archive.org за 3 попытки ({last_error}) — archive.org в этом прогоне не используется")
     return []
 
 
