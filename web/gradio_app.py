@@ -31,6 +31,7 @@ import concurrent.futures
 import io
 import json
 import os
+import random
 import shutil
 import uuid
 
@@ -578,11 +579,17 @@ def run_assembly_stage(footage_file, footage_path, audio_file, audio_path,
                     placeholder_count += 1
                     placeholder_seconds += duration
             elif footage:
+                # Зеркалим по горизонтали примерно половину archive.org-клипов
+                # (не сток — у него нет такого риска) — доп. защита от
+                # точного видео-отпечатка Content ID, вразнобой, чтобы
+                # сам факт отзеркаливания не был очередным узнаваемым паттерном.
+                flip = footage.get("source") == "archive_org" and random.random() < 0.5
                 assemble_video.normalize_clip(
                     raw_path, norm_path, padded,
                     offset=footage.get("best_offset", 0.0),
                     source_duration=footage.get("duration", 0.0),
                     target_width=target_width, target_height=target_height,
+                    flip=flip,
                 )
             else:
                 # Раньше здесь было continue — молча пропускало шот, из-за

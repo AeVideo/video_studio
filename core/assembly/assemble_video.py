@@ -268,12 +268,15 @@ def generate_film_damage_clip(dest: str, duration: float,
 
 
 def normalize_clip(src: str, dest: str, duration: float, offset: float = 0.0, source_duration: float = 0.0,
-                    target_width: int = TARGET_WIDTH, target_height: int = TARGET_HEIGHT):
+                    target_width: int = TARGET_WIDTH, target_height: int = TARGET_HEIGHT, flip: bool = False):
     """Приводит клип к единому разрешению/fps/без звука и точно нужной длительности
     (зацикливает, если исходника не хватает). Если offset задан и клипа хватает
     по длине после сдвига — стартуем с лучшего момента, а не с начала.
     target_width/target_height задают итоговое соотношение сторон (см.
-    ASPECT_RATIOS) — по умолчанию старое поведение 1280×720."""
+    ASPECT_RATIOS) — по умолчанию старое поведение 1280×720.
+    flip=True — горизонтальное зеркалирование (см. вызов в gradio_app.py:
+    применяется только к archive.org-клипам, случайно для части из них,
+    как доп. защита от точного видео-отпечатка Content ID)."""
     if os.path.exists(dest) and _is_valid_video(dest):
         return
     if os.path.exists(dest):
@@ -291,11 +294,14 @@ def normalize_clip(src: str, dest: str, duration: float, offset: float = 0.0, so
     cmd_prefix = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
     if effective_offset:
         cmd_prefix += ["-ss", str(effective_offset)]
+    vf_chain = (f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
+                f"crop={target_width}:{target_height},fps={TARGET_FPS}")
+    if flip:
+        vf_chain += ",hflip"
     cmd_prefix += [
         "-stream_loop", "-1", "-i", src,
         "-t", str(duration),
-        "-vf", f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
-               f"crop={target_width}:{target_height},fps={TARGET_FPS}",
+        "-vf", vf_chain,
         "-an",
     ]
     try:
