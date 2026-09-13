@@ -294,6 +294,12 @@ def find_theme_pool(theme_queries: List[str], rows_per_query: int = 5) -> List[D
             identifier = doc.get("identifier")
             if not identifier or identifier in pool:
                 continue
+            if identifier.startswith("youtube-"):
+                # Зеркало с YouTube, залитое ботом на archive.org, — не то
+                # же самое, что реальная архивная запись (эфир, хроника,
+                # музейный скан). Юридический риск другой категории —
+                # такие кандидаты не берём в пул вообще.
+                continue
             try:
                 video_file = get_best_video_file(identifier)
             except requests.RequestException:
