@@ -190,7 +190,7 @@ def fbi_search(query):
     return gr.update(choices=choices, value=choices[0]), mapping
 
 
-def fbi_build_corpus(selected_title, case_map, max_parts, progress=gr.Progress()):
+def fbi_build_corpus(selected_title, case_map, max_parts, max_ocr_pages, progress=gr.Progress()):
     if not selected_title or not case_map or selected_title not in case_map:
         raise gr.Error("Сначала найдите дело и выберите его из списка")
 
@@ -199,12 +199,14 @@ def fbi_build_corpus(selected_title, case_map, max_parts, progress=gr.Progress()
     case_url = case_map[selected_title]
     out_dir = _persistent_workdir("fbi_case")
     max_parts_val = int(max_parts) if max_parts else None
+    max_ocr_pages_val = int(max_ocr_pages) if max_ocr_pages else None
 
     def on_progress(percent, message):
         progress(min(percent / 100, 0.98), desc=message)
 
     progress(0.0, desc="Открываю Camoufox-сессию...")
-    txt_path = build_case_corpus(case_url, out_dir, max_parts=max_parts_val, on_progress=on_progress)
+    txt_path = build_case_corpus(case_url, out_dir, max_parts=max_parts_val,
+                                  max_ocr_pages=max_ocr_pages_val, on_progress=on_progress)
 
     with open(txt_path, "r", encoding="utf-8") as f:
         text = f.read()
@@ -213,11 +215,15 @@ def fbi_build_corpus(selected_title, case_map, max_parts, progress=gr.Progress()
     return text, f"Собрано {len(text)} символов из «{selected_title}» -> {txt_path}"
 
 
-def fbi_extract_from_pdfs(pdf_files, progress=gr.Progress()):
+def fbi_extract_from_pdfs(pdf_files, max_ocr_pages, progress=gr.Progress()):
     """Если PDF уже скачаны (локально раньше, или перенесены на Colab через
     Drive) — извлекает текст БЕЗ Camoufox. Работает и на Colab: browser здесь
     не участвует, только pdfplumber/OCR (см. scraping/fbi_vault_scraper.py,
-    extract_corpus_from_pdfs — разделено от скачивания намеренно)."""
+    extract_corpus_from_pdfs — разделено от скачивания намеренно).
+    max_ocr_pages ограничивает число страниц, реально прогоняемых через OCR,
+    НА КАЖДУЮ часть дела отдельно (части в деле легко бывают по 700+ страниц —
+    без лимита один такой файл может идти дольше, чем весь остальной пайплайн,
+    и текста для ДипСика выйдет на порядки больше разумного)."""
     if not pdf_files:
         raise gr.Error("Загрузите один или несколько PDF-файлов")
 
@@ -225,12 +231,13 @@ def fbi_extract_from_pdfs(pdf_files, progress=gr.Progress()):
 
     pdf_paths = [f.name for f in pdf_files]
     out_txt = os.path.join(_persistent_workdir("fbi_pdfs"), "combined_source.txt")
+    max_ocr_pages_val = int(max_ocr_pages) if max_ocr_pages else None
 
     def on_progress(percent, message):
         progress(min(percent / 100, 0.98), desc=message)
 
     progress(0.0, desc=f"Обрабатываю {len(pdf_paths)} PDF...")
-    extract_corpus_from_pdfs(pdf_paths, out_txt, on_progress=on_progress)
+    extract_corpus_from_pdfs(pdf_paths, out_txt, max_ocr_pages=max_ocr_pages_val, on_progress=on_progress)
 
     with open(out_txt, "r", encoding="utf-8") as f:
         text = f.read()
@@ -693,10 +700,18 @@ def build_app() -> gr.Blocks:
                     fbi_case_map = gr.State({})
                     fbi_results = gr.Dropdown(label="Найденные дела", choices=[], interactive=True)
                     fbi_max_parts = gr.Number(label="Макс. частей дела (0 = все)", value=5)
+                    fbi_max_ocr_pages_desktop = gr.Number(
+                        label="Макс. страниц OCR на каждую часть (0 = все, части бывают по 700+ стр.)",
+                        value=30,
+                    )
                     fbi_build_btn = gr.Button("Скачать и собрать текст дела")
 
                 with gr.Accordion("PDF уже скачаны — извлечь текст (работает и на Colab)", open=IN_COLAB):
                     fbi_pdf_files = gr.Files(label="PDF-файлы дела", file_types=[".pdf"])
+                    fbi_max_ocr_pages = gr.Number(
+                        label="Макс. страниц OCR на каждый PDF (0 = все, части бывают по 700+ стр.)",
+                        value=30,
+                    )
                     fbi_extract_btn = gr.Button("Извлечь текст из PDF", variant="primary")
 
                 fbi_status = gr.Textbox(label="Статус сбора", interactive=False)
@@ -715,11 +730,11 @@ def build_app() -> gr.Blocks:
 
             fbi_search_btn.click(fbi_search, inputs=fbi_query, outputs=[fbi_results, fbi_case_map])
             fbi_build_btn.click(
-                fbi_build_corpus, inputs=[fbi_results, fbi_case_map, fbi_max_parts],
+                fbi_build_corpus, inputs=[fbi_results, fbi_case_map, fbi_max_parts, fbi_max_ocr_pages_desktop],
                 outputs=[book_text_preview, fbi_status],
             )
             fbi_extract_btn.click(
-                fbi_extract_from_pdfs, inputs=fbi_pdf_files,
+                fbi_extract_from_pdfs, inputs=[fbi_pdf_files, fbi_max_ocr_pages],
                 outputs=[book_text_preview, fbi_status],
             )
 
