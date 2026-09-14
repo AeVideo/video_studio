@@ -31,6 +31,7 @@ requests напрямую.
 
 import argparse
 import os
+import re
 import time
 from typing import List, Dict, Optional, Callable
 
@@ -117,6 +118,52 @@ def extract_text_pdfplumber(pdf_path: str) -> str:
     return "\n".join(text_parts).strip()
 
 
+MIN_TEXT_QUALITY = 0.6  # порог «читаемости» распознанной страницы, см. _text_quality_score
+# откалибровано на реальном деле: страница с убитым сканом (пример из чата,
+# "tesporstblé Washihiton.quettérs") дала 0.5058, а нормально читаемые
+# газетные страницы того же дела — 0.77-0.88; порог 0.6 разводит их с запасом
+
+_WORD_RE = re.compile(r"[a-zA-Z]+")
+_EN_WORDSET: Optional[set] = None
+
+
+def _load_en_wordset() -> set:
+    """Ленивая загрузка словаря (scraping/data/en_wordlist.txt, ~64 тыс. слов
+    из wamerican) — только один раз за процесс."""
+    global _EN_WORDSET
+    if _EN_WORDSET is None:
+        path = os.path.join(os.path.dirname(__file__), "data", "en_wordlist.txt")
+        with open(path, encoding="utf-8") as f:
+            _EN_WORDSET = set(f.read().split())
+    return _EN_WORDSET
+
+
+def _text_quality_score(text: str) -> float:
+    """Дешёвая, без ИИ, оценка «читаемости» распознанного текста (0..1) —
+    без неё убитые газетные вырезки (например, 'tesporstblé Washihiton.
+    quettérs') идут в промпт ДипСику наравне с чистыми машинописными
+    документами дела, разбавляя реальный материал шумом. Комбинация:
+    (1) доля букв/пробелов среди всех символов — мусорный OCR обычно
+    сыплет посторонними символами; (2) доля слов, которые реально есть
+    в словаре английского языка — куда надёжнее любых эвристик по
+    структуре слова, отличает 'salslalive'/'execati' от настоящих слов."""
+    if not text or not text.strip():
+        return 0.0
+    total = len(text)
+    letters_and_spaces = sum(1 for c in text if c.isalpha() or c.isspace())
+    alpha_ratio = letters_and_spaces / total
+
+    words = [w for w in _WORD_RE.findall(text) if len(w) >= 2]
+    if not words:
+        return 0.0
+
+    wordset = _load_en_wordset()
+    known = sum(1 for w in words if w.lower() in wordset)
+    dict_ratio = known / len(words)
+
+    return round(alpha_ratio * dict_ratio, 4)
+
+
 def _page_is_mostly_blank(img, blank_ratio: float = 0.995) -> bool:
     """Быстрая эвристика без OCR по гистограмме яркости: почти полностью белая
     или полностью зачернённая (цензура) страница пропускается — экономит
@@ -132,6 +179,7 @@ def _page_is_mostly_blank(img, blank_ratio: float = 0.995) -> bool:
 
 def extract_text_ocr(pdf_path: str, dpi: int = 150, lang: str = "eng",
                       skip_blank_pages: bool = True,
+                      min_quality: float = MIN_TEXT_QUALITY,
                       max_pages: Optional[int] = None) -> str:
     """Оцифровывает по одной странице за раз, рендеря их на диск (а не держа
     весь документ в памяти сразу через convert_from_path без ограничений) —
@@ -140,7 +188,11 @@ def extract_text_ocr(pdf_path: str, dpi: int = 150, lang: str = "eng",
     max_pages ограничивает число СТРАНИЦ, КОТОРЫЕ ВООБЩЕ РЕНДЕРЯТСЯ (не
     только распознаются) — критично для дел с частями в сотни страниц:
     без этого convert_from_path растеризует весь документ, даже если
-    распознать реально нужно только первые N."""
+    распознать реально нужно только первые N.
+    min_quality — страницы, чей _text_quality_score ниже порога (убитые
+    газетные вырезки и т.п.), в итоговый текст НЕ попадают: лучше меньше
+    материала, но чистого, чем много шума, который потом читает ДипСик
+    наравне с настоящими документами дела. min_quality=0 отключает фильтр."""
     from pdf2image import convert_from_path
     import pytesseract
     import tempfile
@@ -153,6 +205,7 @@ def extract_text_ocr(pdf_path: str, dpi: int = 150, lang: str = "eng",
         total = len(paths)
         text_parts = []
         skipped_blank = 0
+        skipped_low_quality = 0
         for i, img_path in enumerate(paths, 1):
             img = Image.open(img_path)
             if skip_blank_pages and _page_is_mostly_blank(img):
@@ -161,10 +214,20 @@ def extract_text_ocr(pdf_path: str, dpi: int = 150, lang: str = "eng",
                 img.close()
                 os.remove(img_path)
                 continue
-            print(f"        OCR страница {i}/{total}...", flush=True)
-            text_parts.append(pytesseract.image_to_string(img, lang=lang))
+            page_text = pytesseract.image_to_string(img, lang=lang)
+            score = _text_quality_score(page_text)
+            if min_quality and score < min_quality:
+                print(f"        страница {i}/{total}: OCR дал score={score} "
+                      f"(< {min_quality}) — похоже на нечитаемый скан, в текст не идёт", flush=True)
+                skipped_low_quality += 1
+            else:
+                print(f"        OCR страница {i}/{total}... score={score}", flush=True)
+                text_parts.append(page_text)
             img.close()
             os.remove(img_path)
+
+        if skipped_low_quality:
+            print(f"        итого пропущено по качеству: {skipped_low_quality}/{total} страниц", flush=True)
 
         # Реальный случай: в Colab процесс "отрапортовал успех" (все страницы
         # прошли цикл без единого исключения), но итоговый текст оказался
