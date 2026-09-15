@@ -137,7 +137,72 @@ def split_book_into_stories(
         # для структурированного JSON-вывода думающий режим не нужен, отключаем явно.
         extra_body={"thinking": {"type": "disabled"}},
     )
-    return _parse_json_response(response, context_label="split_book_into_stories")
+    stories = _parse_json_response(response, context_label="split_book_into_stories")
+    return _verify_source_grounding(stories, book_text, context_label="split_book_into_stories")
+
+
+# Заголовок/summary DeepSeek выдумывает не так часто — а вот source_excerpt,
+# судя по реальному прогону (десктопный тест на архивном деле Брежнева,
+# вернувший ПОЛНОСТЬЮ несвязанную историю про "Николая Ленина" из
+# англоязычных газетных вырезок 1940-х про советскую внешнюю политику),
+# может относиться к материалу, которого в book_text попросту нет —
+# модель дописывает историю "из общих знаний" вместо того, чтобы честно
+# сказать "в этом куске текста содержательной истории не нашлось". Раньше
+# такое тихо доходило до write_script_for_story и озвучки. Тот же принцип,
+# что у _text_quality_score в fbi_vault_scraper.py: не ML, а простое
+# совпадение по словам между тем, что модель ЗАЯВЛЯЕТ как источник, и тем,
+# что реально есть в book_text.
+_WORD_RE = __import__("re").compile(r"\w+", __import__("re").UNICODE)
+
+
+def _normalize_for_grounding(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _verify_source_grounding(
+    stories: List[Dict],
+    book_text: str,
+    context_label: str,
+    min_word_overlap: float = 0.5,
+    min_excerpt_words: int = 4,
+) -> List[Dict]:
+    normalized_source = _normalize_for_grounding(book_text)
+    grounded, dropped = [], []
+    for story in stories:
+        excerpt = (story.get("source_excerpt") or "").strip()
+        normalized_excerpt = _normalize_for_grounding(excerpt)
+        words = [w for w in _WORD_RE.findall(normalized_excerpt) if len(w) > 3]
+        if len(words) < min_excerpt_words:
+            # Слишком короткий/пустой excerpt нельзя ни подтвердить, ни опровергнуть
+            # по словам — не блокируем историю из-за этого, это отдельная проблема
+            # (модель поленилась привести цитату), не признак выдумки.
+            grounded.append(story)
+            continue
+        found = sum(1 for w in words if w in normalized_source)
+        overlap = found / len(words)
+        if overlap >= min_word_overlap:
+            grounded.append(story)
+        else:
+            dropped.append((story, overlap))
+
+    if dropped:
+        details = "; ".join(
+            f"{s.get('title', s.get('id', '?'))!r} (совпадение {ov:.0%})" for s, ov in dropped
+        )
+        print(
+            f"{context_label}: отброшено {len(dropped)} историй, чей source_excerpt "
+            f"не находит опоры в book_text (похоже на выдумку модели): {details}"
+        )
+
+    if not grounded:
+        raise RuntimeError(
+            f"{context_label}: ни одна из {len(stories)} предложенных историй не подтвердилась "
+            f"текстом источника — source_excerpt всех историй почти не пересекается по словам "
+            f"с book_text. Похоже, DeepSeek выдумал истории вместо того, чтобы найти их в реальном "
+            f"материале (частая причина — плохое качество OCR исходника, см. _text_quality_score "
+            f"в fbi_vault_scraper.py; проверьте, каким текстом реально наполнен book_text)."
+        )
+    return grounded
 
 
 # ---------- 2. Сценарий одной истории с учётом длительности ----------
