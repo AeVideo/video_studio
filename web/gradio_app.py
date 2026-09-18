@@ -450,6 +450,9 @@ def run_matching_stage(shots_file, shots_path, aspect_ratio, progress=gr.Progres
     archive_pool = []
     archive_dead_ids = set()
     if pexels_matcher.archive_org_search is not None:
+        archive_dead_ids = pexels_matcher.archive_org_search.load_dead_ids_cache()
+        if archive_dead_ids:
+            print(f"    archive.org: загружен кэш мёртвых identifier'ов из прошлых прогонов: {len(archive_dead_ids)}")
         progress(0.02, desc="Ищу тематические подборки в Archive.org...")
         story_summary = " ".join(s["text"] for s in scenes)[:2000]
         with _progress_stdout(progress, 0.02):
@@ -470,6 +473,8 @@ def run_matching_stage(shots_file, shots_path, aspect_ratio, progress=gr.Progres
             )
         results.append(matched)
         _save_partial_matching(out_path, data, results)  # инкрементально — тот же паттерн, что MatchWorker
+        if pexels_matcher.archive_org_search is not None:
+            pexels_matcher.archive_org_search.save_dead_ids_cache(archive_dead_ids)
 
     if not scenes:
         _save_partial_matching(out_path, data, results)

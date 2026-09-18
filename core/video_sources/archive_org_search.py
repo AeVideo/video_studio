@@ -24,10 +24,12 @@ API (публичные, без ключа):
 
 import argparse
 import concurrent.futures
+import json
 import os
 import re
 import subprocess
 import tempfile
+import time
 from typing import List, Dict, Optional
 
 import requests
@@ -92,7 +94,12 @@ def _strip_temporal_tokens(query: str) -> str:
 # range-запросы, если сервер их поддерживает — archive.org поддерживает).
 OFFSET_SAMPLE_COUNT = 10          # сколько точек пробуем на весь ролик
 OFFSET_EDGE_MARGIN_SEC = 5.0      # не сэмплируем совсем у начала/конца (титры/чернота)
-FRAME_EXTRACT_TIMEOUT = 25        # сек на одну попытку вытащить кадр по сети
+FRAME_EXTRACT_TIMEOUT = 12        # сек на одну попытку вытащить кадр по сети — было 25;
+# по реальным прогонам нормальный ответ archive.org занимает секунды, 25с
+# в основном тратились впустую на достукивание до уже мёртвого/перегруженного
+# сервера. Короче таймаут = быстрее сдаться и попробовать следующего
+# кандидата, а не быстрее скачать (сеть не ускоряется от смены числа).
+QUICK_CHECK_TIMEOUT = 6           # сек на дешёвую проверку "жив ли URL", ДО ffmpeg
 
 # Форматы, которые реально можно скормить ffmpeg как видео — у каждого item
 # на Archive.org обычно несколько файлов (превью, .torrent, xml-метаданные
@@ -100,10 +107,53 @@ FRAME_EXTRACT_TIMEOUT = 25        # сек на одну попытку выта
 VIDEO_FORMATS = {"h.264", "h.264 IA", "MPEG4", "MPEG2", "Matroska", "Ogg Video", "512Kb MPEG4"}
 
 
-def search_videos(query: str, rows: int = 10) -> List[Dict]:
+# Жёсткий верхний предел по дате: мы ищем архивные кино-/документальные
+# материалы под content_mode="historical", а не что попало с Archive.org
+# (там полно современных загрузок — записи заседаний муниципалитетов,
+# ютуб-интервью с активистами, DVD-рипы). Реальный прогон (дело Anna May
+# Wong) показывал десятки минут впустую потраченных на такие кандидаты:
+# 'New_Lenox_Village_Board_-_November_11_2024', 'speaking-with-a-uyghur-
+# activist-about-xinjiang-abuse', 'brntwdca-...City_Council...2023' — их
+# физически не может устроить дата события. Год 2000 — намеренно с запасом
+# позже конца "историчной" эпохи: лучше пропустить пару пограничных
+# материалов начала 2000-х, чем НЕ отфильтровать явно современный мусор.
+MAX_ARCHIVE_YEAR = 2000
+
+
+# Простой отсев по ключевым словам в заголовке/описании — год/дата не
+# защищают от мусора, у которого метаданные произвольные или ошибочные
+# (реальный пример из прогона: item с year=1984, но заголовок в духе
+# конспирологии/экстремистского контента — явно не архивная хроника).
+# Список сознательно короткий и по конкретным маркерам, а не по темам —
+# расширяйте по мере того, что реально всплывает в выдаче.
+_JUNK_TITLE_MARKERS = ("goyimtv", "deepstate", "gray state", "qanon")
+
+
+def _is_junk_title(doc: Dict) -> bool:
+    text = f"{doc.get('title', '')} {doc.get('description', '')}".lower()
+    return any(marker in text for marker in _JUNK_TITLE_MARKERS)
+
+
+def _year_ok(doc: Dict, max_year: int) -> bool:
+    """True если год item'а неизвестен (нет метаданных — не наш сигнал для
+    отсева, могла быть и старая киноплёнка без даты) ИЛИ не позже max_year."""
+    raw_year = doc.get("year")
+    if not raw_year:
+        return True
+    match = re.search(r"\d{4}", str(raw_year))
+    if not match:
+        return True
+    return int(match.group()) <= max_year
+
+
+def search_videos(query: str, rows: int = 10, max_year: int = MAX_ARCHIVE_YEAR) -> List[Dict]:
     search_query = _strip_temporal_tokens(query)
+    # Фильтр по дате прямо в запросе — экономит сами обращения к archive.org
+    # и последующую (дорогую) проверку ffmpeg на заведомо непригодных
+    # кандидатах, а не просто выбрасывает их после получения.
+    date_filter = f"AND date:[1850-01-01 TO {max_year}-12-31]" if max_year else ""
     params = {
-        "q": f"({search_query}) AND mediatype:(movies)",
+        "q": f"({search_query}) AND mediatype:(movies) {date_filter}".strip(),
         "fl[]": ["identifier", "title", "description", "year"],
         "rows": rows,
         "page": 1,
@@ -112,7 +162,14 @@ def search_videos(query: str, rows: int = 10) -> List[Dict]:
     resp = requests.get(SEARCH_URL, params=params, timeout=20)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("response", {}).get("docs", [])
+    docs = data.get("response", {}).get("docs", [])
+    # Подстраховка: у части item'ов заполнен year, но не date (или наоборот) —
+    # серверный фильтр по одному полю их не поймает. Отсеиваем и по year там,
+    # где он явно указывает на современную загрузку.
+    if max_year:
+        docs = [d for d in docs if _year_ok(d, max_year)]
+    docs = [d for d in docs if not _is_junk_title(d)]
+    return docs
 
 
 def get_best_video_file(identifier: str) -> Optional[Dict]:
@@ -173,6 +230,23 @@ def _extract_frame_at(video_url: str, timestamp: float, dest_path: str, verbose:
         return False
 
 
+def _quick_reachable(url: str, timeout: float = QUICK_CHECK_TIMEOUT) -> bool:
+    """Дешёвая проверка ДО дорогого ffmpeg-сэмплинга: если сервер не отдаёт
+    даже первый килобайт за несколько секунд, он не отдаст и видео-кадр за
+    FRAME_EXTRACT_TIMEOUT секунд — но узнаём мы это на порядок быстрее.
+    Range-запрос на первый байт, не полная загрузка. archive.org
+    поддерживает range-запросы (см. комментарий у ffmpeg input-seek ниже).
+    Главный смысл: за реальный прогон, где половина кандидатов пула мертва/
+    недоступна, это разница между "полсекунды на дохлого кандидата" и
+    "до 25-50 секунд ffmpeg-таймаутов на него же"."""
+    try:
+        resp = requests.get(url, headers={"Range": "bytes=0-1024"}, timeout=timeout, stream=True)
+        resp.close()
+        return resp.status_code in (200, 206)
+    except requests.RequestException:
+        return False
+
+
 def find_best_offset(video_url: str, duration: float, query: str, clip_scorer: "ClipScorer",
                       num_samples: int = OFFSET_SAMPLE_COUNT) -> Optional[Dict]:
     """Сэмплирует кадры по всей длине ролика, скорит их тем же CLIP, что и
@@ -187,6 +261,10 @@ def find_best_offset(video_url: str, duration: float, query: str, clip_scorer: "
     ffmpeg, поэтому параллелизм здесь реальный, как и в
     core/video_sources/pexels_matcher.py::score_candidate."""
     if not duration or duration <= OFFSET_EDGE_MARGIN_SEC * 2:
+        return None
+    if not _quick_reachable(video_url):
+        # см. _quick_reachable — ловим мёртвый/недоступный URL за секунды,
+        # а не за десятки секунд ffmpeg-таймаутов ниже.
         return None
 
     usable_start = OFFSET_EDGE_MARGIN_SEC
@@ -273,6 +351,58 @@ def _probe_duration(video_url: str) -> float:
         return 0.0
 
 
+DEAD_IDS_CACHE_MAX_AGE_DAYS = 14  # мёртвый сегодня identifier может отдаться
+# завтра (временная перегрузка/сетевой сбой у archive.org, не обязательно
+# сломанный файл) — не хороним identifier навсегда, даём кэшу протухать.
+
+
+def _dead_ids_cache_path() -> str:
+    # Ленивый импорт — тот же принцип, что и с ClipScorer выше: не тянуть
+    # config.paths на уровне модуля без необходимости, чтобы не плодить
+    # лишние точки отказа импорта в CLI-режиме (python archive_org_search.py).
+    from config.paths import VIDEO_STUDIO_HOME
+    return os.path.join(VIDEO_STUDIO_HOME, "archive_org_dead_ids.json")
+
+
+def load_dead_ids_cache(max_age_days: float = DEAD_IDS_CACHE_MAX_AGE_DAYS) -> set:
+    """Читает identifier'ы, признанные мёртвыми в прошлых прогонах (см.
+    save_dead_ids_cache) — вызывать один раз при старте проекта, чтобы
+    заново собранный archive_dead_ids не начинал с нуля после каждого
+    падения/перезапуска Colab-рантайма."""
+    try:
+        with open(_dead_ids_cache_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+    cutoff = time.time() - max_age_days * 86400
+    return {identifier for identifier, ts in data.items() if ts >= cutoff}
+
+
+def save_dead_ids_cache(dead_ids: set) -> None:
+    """Мержит с уже сохранённым на диске кэшем, а не перезаписывает его
+    целиком — вызывается инкрементально (после каждой сцены, см.
+    web/gradio_app.py), если несколько записей пересекутся по времени,
+    потерять чужую запись менее болезненно, чем каждый раз стирать всё,
+    что кэш уже знал. Кэш — оптимизация, не критичный путь: ошибка диска
+    здесь не должна ронять пайплайн."""
+    if not dead_ids:
+        return
+    path = _dead_ids_cache_path()
+    try:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            existing = {}
+        now = time.time()
+        existing.update({identifier: now for identifier in dead_ids})
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(existing, f)
+    except OSError as e:
+        print(f"    archive.org: не удалось сохранить кэш мёртвых identifier'ов: {e}")
+
+
 def find_theme_pool(theme_queries: List[str], rows_per_query: int = 5) -> List[Dict]:
     """Ищет ШИРОКИЕ тематические видео целиком (документалки/хроника) —
     вызывается ОДИН РАЗ на весь проект с 4-6 широкими темами (эпоха/место/
@@ -352,17 +482,29 @@ def find_best_in_pool(pool: List[Dict], literal_query: str, clip_scorer: "ClipSc
     candidates = sorted(candidates, key=lambda v: v.get("duration", 0), reverse=True)[:videos_to_try]
 
     best = None  # (score, video, offset, frame_path)
-    for video in candidates:
-        found = find_best_offset(video["video_link"], video["duration"], literal_query, clip_scorer,
-                                  num_samples=samples_per_video)
-        if found is None:
-            print(f"    archive.org (пул): '{video['archive_id']}' не удалось проверить, пробую следующий")
-            if dead_ids is not None:
-                dead_ids.add(video["archive_id"])
-            continue
-        print(f"    archive.org (пул): '{video['archive_id']}' score={found['score']}")
-        if best is None or found["score"] > best[0]:
-            best = (found["score"], video, found["offset"], found["frame_path"])
+    # Кандидаты-видео пробуются ПАРАЛЛЕЛЬНО, не по очереди — раньше, если
+    # первое видео зависало на сети (см. FRAME_EXTRACT_TIMEOUT), второе
+    # даже не начинало проверяться, пока первое не отвалится целиком.
+    # ThreadPoolExecutor здесь безопасен по той же причине, что и в
+    # find_best_offset — subprocess.run/requests отпускают GIL на время
+    # сетевого ожидания.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(candidates), 1)) as executor:
+        future_to_video = {
+            executor.submit(find_best_offset, video["video_link"], video["duration"],
+                             literal_query, clip_scorer, samples_per_video): video
+            for video in candidates
+        }
+        for future in concurrent.futures.as_completed(future_to_video):
+            video = future_to_video[future]
+            found = future.result()
+            if found is None:
+                print(f"    archive.org (пул): '{video['archive_id']}' не удалось проверить, пробую следующий")
+                if dead_ids is not None:
+                    dead_ids.add(video["archive_id"])
+                continue
+            print(f"    archive.org (пул): '{video['archive_id']}' score={found['score']}")
+            if best is None or found["score"] > best[0]:
+                best = (found["score"], video, found["offset"], found["frame_path"])
 
     if best is None:
         return None

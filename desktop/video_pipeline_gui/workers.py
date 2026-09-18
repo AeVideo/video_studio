@@ -305,6 +305,7 @@ class MatchWorker(QThread):
             archive_pool = []
             archive_dead_ids = set()
             if pexels_matcher.archive_org_search is not None:
+                archive_dead_ids = pexels_matcher.archive_org_search.load_dead_ids_cache()
                 story_summary = " ".join(s["text"] for s in scenes)[:2000]
                 theme_queries = pexels_matcher.generate_archive_theme_queries(story_summary, deepseek_client)
                 if theme_queries:
@@ -325,6 +326,8 @@ class MatchWorker(QThread):
                 )
                 results.append(matched)
                 self._save_partial(data, results)
+                if pexels_matcher.archive_org_search is not None:
+                    pexels_matcher.archive_org_search.save_dead_ids_cache(archive_dead_ids)
 
             # Если сцен не было — всё равно создаём файл с пустым списком.
             if not scenes:
