@@ -33,6 +33,8 @@ import json
 import os
 import random
 import shutil
+import threading
+import time
 import uuid
 
 # GRADIO_TEMP_DIR должен быть установлен ДО импорта gradio — библиотека
@@ -422,7 +424,117 @@ def _save_partial_matching(out_path, data, results):
     os.replace(tmp_path, out_path)
 
 
-def run_matching_stage(shots_file, shots_path, aspect_ratio, progress=gr.Progress()):
+def _write_job_status(status_path, state, message, out_path=None):
+    """state: 'running' | 'done' | 'error'. Атомарная запись (tmp+replace) —
+    тот же паттерн, что и _save_partial_matching, чтобы poll_matching_job
+    никогда не прочитал наполовину записанный JSON."""
+    payload = {"state": state, "message": message, "out_path": out_path, "updated_at": time.time()}
+    tmp_path = status_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, status_path)
+    except OSError:
+        pass  # статус-файл — не критичный путь, как и кэш мёртвых id в archive_org_search.py
+
+
+class _StatusStdout(io.StringIO):
+    """То же самое, что _ProgressStdout выше, но для фонового потока: там
+    нет живого gr.Progress (он привязан к конкретному HTTP/WS-запросу,
+    которого здесь больше нет), поэтому пишем ту же самую построчную печать
+    из match_scene() прямо в status-файл на диске."""
+
+    def __init__(self, status_path, base_desc):
+        super().__init__()
+        self.status_path = status_path
+        self.base_desc = base_desc
+
+    def write(self, s):
+        line = s.strip()
+        if line:
+            _write_job_status(self.status_path, "running", f"{self.base_desc} {line[:200]}")
+        return super().write(s)
+
+
+@contextlib.contextmanager
+def _status_stdout(status_path, base_desc):
+    with contextlib.redirect_stdout(_StatusStdout(status_path, base_desc)):
+        yield
+
+
+def _matching_worker(resolved_shots, pexels_key, pixabay_key, orientation, out_dir, status_path):
+    """Реальная работа этапа «Подбор видео» — раньше выполнялась синхронно
+    внутри одного HTTP/WS-запроса Gradio (run_matching_stage). Проблема на
+    Colab: сцена может занимать минуты, весь прогон — час(ы); если браузер
+    отправлен в фон (другое окно/вкладка) или соединение просто оборвалось
+    ('Broken Connection' — реальный случай пользователя), сам поток внутри
+    Gradio, завязанный на тот конкретный запрос, обрывается вместе с ним, и
+    работа теряется, несмотря на то что уже сохранённый footage.json на
+    диске остаётся.
+
+    Теперь эта функция запускается как daemon-поток ВНУТРИ уже живого
+    процесса gradio_app.py (см. start_matching_job) — она не привязана ни к
+    какому конкретному запросу браузера и продолжает работать независимо от
+    того, открыта ли вкладка, свёрнута ли, или соединение вообще разорвано.
+    Единственное, что всё ещё может её прервать — смерть самого процесса
+    (пересоздание Colab-рантайма). UI узнаёт о прогрессе через
+    poll_matching_job, читая status.json с опросом по таймеру, а не держа
+    запрос открытым все время работы."""
+    try:
+        with open(resolved_shots, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        scenes = data["scenes"]
+        out_path = os.path.join(out_dir, "footage.json")
+
+        _write_job_status(status_path, "running", "Загружаю CLIP и подключаюсь к DeepSeek...")
+        deepseek_client = pexels_matcher.get_deepseek_client()
+        clip_scorer = pexels_matcher.ClipScorer()
+        used_ids = set()
+        thumbnails_dir = os.path.join(out_dir, pexels_matcher.THUMBNAILS_DIR_NAME)
+
+        archive_pool = []
+        archive_dead_ids = set()
+        if pexels_matcher.archive_org_search is not None:
+            archive_dead_ids = pexels_matcher.archive_org_search.load_dead_ids_cache()
+            _write_job_status(status_path, "running", "Ищу тематические подборки в Archive.org...")
+            story_summary = " ".join(s["text"] for s in scenes)[:2000]
+            with _status_stdout(status_path, "Archive.org:"):
+                theme_queries = pexels_matcher.generate_archive_theme_queries(story_summary, deepseek_client)
+                if theme_queries:
+                    archive_pool = pexels_matcher.archive_org_search.find_theme_pool(theme_queries)
+
+        results = []
+        for i, scene in enumerate(scenes, 1):
+            base_desc = f"[{i}/{len(scenes)}] {scene['id']}: начинаю подбор..."
+            _write_job_status(status_path, "running", base_desc)
+            with _status_stdout(status_path, base_desc):
+                matched = pexels_matcher.match_scene(
+                    scene, deepseek_client, clip_scorer, pexels_key, used_ids,
+                    pixabay_key=pixabay_key, thumbnails_dir=thumbnails_dir,
+                    orientation=orientation, archive_pool=archive_pool,
+                    archive_dead_ids=archive_dead_ids,
+                )
+            results.append(matched)
+            _save_partial_matching(out_path, data, results)  # инкрементально, как раньше
+            if pexels_matcher.archive_org_search is not None:
+                pexels_matcher.archive_org_search.save_dead_ids_cache(archive_dead_ids)
+            _write_job_status(status_path, "running", f"[{i}/{len(scenes)}] готово", out_path=out_path)
+
+        if not scenes:
+            _save_partial_matching(out_path, data, results)
+
+        _write_job_status(status_path, "done",
+                           f"Подобрано видео для {len(results)}/{len(scenes)} шотов -> {out_path}",
+                           out_path=out_path)
+    except Exception as e:
+        _write_job_status(status_path, "error", f"Ошибка: {e}")
+
+
+def start_matching_job(shots_file, shots_path, aspect_ratio):
+    """Запускает _matching_worker фоновым daemon-потоком и СРАЗУ возвращает
+    управление — сам HTTP/WS-запрос от кнопки живёт секунды, а не часы,
+    поэтому 'Broken Connection' на нём практически невозможен. Дальше UI
+    сам опрашивает статус по таймеру (см. poll_matching_job)."""
     resolved_shots = _resolve_path(shots_file, shots_path, "shots.json")
     if resolved_shots is None:
         raise gr.Error("Укажите shots.json (результат этапа «Сцены → Шоты») — файлом или путём на диске")
@@ -433,54 +545,45 @@ def run_matching_stage(shots_file, shots_path, aspect_ratio, progress=gr.Progres
         raise gr.Error("PEXELS_API_KEY не задан (.env локально / Colab Secrets на Colab)")
 
     orientation = "portrait" if aspect_ratio == "9:16" else "landscape"
-
-    with open(resolved_shots, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    scenes = data["scenes"]
-
     out_dir = _persistent_workdir("matching")
-    out_path = os.path.join(out_dir, "footage.json")
+    status_path = os.path.join(out_dir, "status.json")
+    _write_job_status(status_path, "running", "Задача запущена в фоне...")
 
-    progress(0.0, desc="Загружаю CLIP и подключаюсь к DeepSeek...")
-    deepseek_client = pexels_matcher.get_deepseek_client()
-    clip_scorer = pexels_matcher.ClipScorer()  # кэшируется на уровне класса — повторные вызовы дёшевы
-    used_ids = set()
-    thumbnails_dir = os.path.join(out_dir, pexels_matcher.THUMBNAILS_DIR_NAME)
+    thread = threading.Thread(
+        target=_matching_worker,
+        args=(resolved_shots, pexels_key, pixabay_key, orientation, out_dir, status_path),
+        daemon=True,
+    )
+    thread.start()
 
-    archive_pool = []
-    archive_dead_ids = set()
-    if pexels_matcher.archive_org_search is not None:
-        archive_dead_ids = pexels_matcher.archive_org_search.load_dead_ids_cache()
-        if archive_dead_ids:
-            print(f"    archive.org: загружен кэш мёртвых identifier'ов из прошлых прогонов: {len(archive_dead_ids)}")
-        progress(0.02, desc="Ищу тематические подборки в Archive.org...")
-        story_summary = " ".join(s["text"] for s in scenes)[:2000]
-        with _progress_stdout(progress, 0.02):
-            theme_queries = pexels_matcher.generate_archive_theme_queries(story_summary, deepseek_client)
-            if theme_queries:
-                archive_pool = pexels_matcher.archive_org_search.find_theme_pool(theme_queries)
+    return (
+        status_path,  # -> match_job_state (gr.State), передаётся в poll_matching_job
+        None,  # match_file_out — пока пусто, появится когда будет готов первый результат
+        "Задача запущена в фоне. Прогресс обновляется автоматически каждые несколько секунд — "
+        "вкладку можно закрыть или свернуть, работа продолжится на сервере.",
+        gr.Timer(active=True),  # включаем опрос
+    )
 
-    results = []
-    for i, scene in enumerate(scenes, 1):
-        base_percent = i / max(len(scenes), 1)
-        progress(base_percent, desc=f"[{i}/{len(scenes)}] {scene['id']}: начинаю подбор...")
-        with _progress_stdout(progress, base_percent):
-            matched = pexels_matcher.match_scene(
-                scene, deepseek_client, clip_scorer, pexels_key, used_ids,
-                pixabay_key=pixabay_key, thumbnails_dir=thumbnails_dir,
-                orientation=orientation, archive_pool=archive_pool,
-                archive_dead_ids=archive_dead_ids,
-            )
-        results.append(matched)
-        _save_partial_matching(out_path, data, results)  # инкрементально — тот же паттерн, что MatchWorker
-        if pexels_matcher.archive_org_search is not None:
-            pexels_matcher.archive_org_search.save_dead_ids_cache(archive_dead_ids)
 
-    if not scenes:
-        _save_partial_matching(out_path, data, results)
+def poll_matching_job(status_path):
+    """Вызывается gr.Timer каждые несколько секунд, пока идёт фоновая
+    работа (см. start_matching_job). Останавливает сам себя (Timer
+    active=False), как только job перешёл в 'done'/'error' — дальше опрос
+    просто не нужен."""
+    if not status_path:
+        return gr.skip(), gr.skip(), gr.Timer(active=False)
+    try:
+        with open(status_path, "r", encoding="utf-8") as f:
+            status = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return gr.skip(), "Жду первый статус от фонового потока...", gr.skip()
 
-    progress(1.0, desc="Готово")
-    return out_path, f"Подобрано видео для {len(results)}/{len(scenes)} шотов -> {out_path}"
+    state = status.get("state")
+    message = status.get("message", "")
+    out_path = status.get("out_path")
+    file_update = out_path if (out_path and os.path.exists(out_path)) else gr.skip()
+    still_running = state == "running"
+    return file_update, message, gr.Timer(active=still_running)
 
 
 # ---------------------------------------------------------------------------
@@ -810,10 +913,12 @@ def build_app() -> gr.Blocks:
 
         with gr.Tab("4. Подбор видео"):
             gr.Markdown(
-                "Подбор по каждому шоту (Pexels/Pixabay/Archive.org + CLIP-скоринг). "
-                "Прогресс сохраняется инкрементально после каждого шота — как и в десктопном "
-                "GUI (см. `MatchWorker._save_partial`), при обрыве прогона отдать частично "
-                "готовый `footage.json` не проблема."
+                "Подбор по каждому шоту (Pexels/Pixabay/Archive.org + CLIP-скоринг). Запускается "
+                "фоновым потоком на сервере — кнопка возвращает управление сразу, прогресс "
+                "опрашивается автоматически. Вкладку можно закрыть или свернуть, работа "
+                "продолжится; прогресс сохраняется инкрементально после каждого шота — как и в "
+                "десктопном GUI (см. `MatchWorker._save_partial`), при обрыве прогона отдать "
+                "частично готовый `footage.json` не проблема."
             )
             shots_file = gr.File(label="shots.json (результат этапа «Сцены → Шоты»)")
             shots_path_input = gr.Textbox(label="...или путь на диске (Drive)",
@@ -822,9 +927,15 @@ def build_app() -> gr.Blocks:
             match_btn = gr.Button("Подобрать видео", variant="primary")
             match_file_out = gr.File(label="footage.json")
             match_status_out = gr.Textbox(label="Статус")
+            match_job_state = gr.State()
+            match_timer = gr.Timer(value=4, active=False)
             match_evt = match_btn.click(
-                run_matching_stage, inputs=[shots_file, shots_path_input, match_aspect],
-                outputs=[match_file_out, match_status_out],
+                start_matching_job, inputs=[shots_file, shots_path_input, match_aspect],
+                outputs=[match_job_state, match_file_out, match_status_out, match_timer],
+            )
+            match_timer.tick(
+                poll_matching_job, inputs=[match_job_state],
+                outputs=[match_file_out, match_status_out, match_timer],
             )
 
         with gr.Tab("5. Сборка"):
@@ -895,7 +1006,7 @@ def build_app() -> gr.Blocks:
             inputs=[audio_file, subs_audio_path], outputs=[assembly_audio_path],
         )
         shots_evt.then(_as_path, inputs=[shots_file_out], outputs=[shots_path_input])
-        match_evt.then(_as_path, inputs=[match_file_out], outputs=[footage_path])
+        match_timer.tick(_as_path, inputs=[match_file_out], outputs=[footage_path])
 
     return demo
 
