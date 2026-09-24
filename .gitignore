@@ -41,3 +41,8 @@ output/
 # api_jobs пишет прямо в ./output/ при некоторых сценариях запуска
 output/
 *.patch
+
+# Flow — профили аккаунтов и конфиг с лимитами (секреты сессий)
+flow_accounts.json
+*.mp4
+*.srt
